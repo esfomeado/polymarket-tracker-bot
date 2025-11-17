@@ -77,7 +77,7 @@ const client = new Client({
 
 let isInitialized = false;
 const seenHashes = new Set();
-const seenMarkets = new Set();
+const seenMarketOutcomes = new Set();
 let isPolling = false;
 let pollTimeout = null;
 let activeChannel = null;
@@ -129,8 +129,8 @@ async function pollOnce() {
     if (!isInitialized) {
       trades.forEach((trade) => {
         seenHashes.add(trade.transactionHash);
-        if (trade.conditionId) {
-          seenMarkets.add(trade.conditionId);
+        if (trade.conditionId && trade.outcome) {
+          seenMarketOutcomes.add(`${trade.conditionId}:${trade.outcome}`);
         }
       });
       isInitialized = true;
@@ -153,12 +153,17 @@ async function pollOnce() {
     for (const trade of newTrades.reverse()) {
       seenHashes.add(trade.transactionHash);
 
-      if (trade.conditionId && seenMarkets.has(trade.conditionId)) {
+      const marketOutcomeKey =
+        trade.conditionId && trade.outcome
+          ? `${trade.conditionId}:${trade.outcome}`
+          : null;
+
+      if (marketOutcomeKey && seenMarketOutcomes.has(marketOutcomeKey)) {
         continue;
       }
 
-      if (trade.conditionId) {
-        seenMarkets.add(trade.conditionId);
+      if (marketOutcomeKey) {
+        seenMarketOutcomes.add(marketOutcomeKey);
       }
 
       const {
@@ -460,7 +465,7 @@ async function startPolling(channel, walletAddress = null) {
   activeChannel = channel;
   isPolling = true;
   isInitialized = false;
-  seenMarkets.clear();
+  seenMarketOutcomes.clear();
 
   const walletDisplay =
     walletToUse === DEFAULT_WALLET
