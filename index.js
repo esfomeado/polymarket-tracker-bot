@@ -80,10 +80,12 @@ if (POLYMARKET_PRIVATE_KEY) {
         signatureType: POLYMARKET_SIGNATURE_TYPE,
       });
 
-      const tempClient = new ClobClient(host, chainId, signer);
-      const creds = await tempClient.createOrDeriveApiKey();
+      const credsPromise = new ClobClient(host, chainId, signer).deriveApiKey();
+      const creds = await credsPromise;
       logToFile("DEBUG", "API credentials created", {
         credsType: typeof creds,
+        credsKeys:
+          creds && typeof creds === "object" ? Object.keys(creds) : null,
       });
 
       if (POLYMARKET_FUNDER) {
