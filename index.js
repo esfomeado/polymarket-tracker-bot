@@ -81,11 +81,23 @@ if (POLYMARKET_PRIVATE_KEY) {
       });
 
       const credsPromise = new ClobClient(host, chainId, signer).deriveApiKey();
-      const creds = await credsPromise;
+      const rawCreds = await credsPromise;
+
+      const creds = {
+        key: rawCreds.apiKey || rawCreds.key,
+        secret: rawCreds.secret,
+        passphrase: rawCreds.passphrase,
+      };
+
       logToFile("DEBUG", "API credentials created", {
         credsType: typeof creds,
-        credsKeys:
-          creds && typeof creds === "object" ? Object.keys(creds) : null,
+        hasKey: !!creds.key,
+        hasSecret: !!creds.secret,
+        hasPassphrase: !!creds.passphrase,
+        rawCredsKeys:
+          rawCreds && typeof rawCreds === "object"
+            ? Object.keys(rawCreds)
+            : null,
       });
 
       if (POLYMARKET_FUNDER) {
