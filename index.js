@@ -57,6 +57,10 @@ const AUTO_TRADE_ENABLED = process.env.AUTO_TRADE_ENABLED === "true";
 const AUTO_TRADE_FILTER = process.env.AUTO_TRADE_FILTER;
 const AUTO_TRADE_AMOUNT_USD = Number(process.env.AUTO_TRADE_AMOUNT_USD ?? 1);
 const AUTO_TRADE_USE_MARKET = process.env.AUTO_TRADE_USE_MARKET === "true";
+const CLOUDFLARE_RETRY_DELAY_MS = Number(
+  process.env.CLOUDFLARE_RETRY_DELAY_MS ?? 60000
+);
+const MAX_CLOUDFLARE_RETRIES = Number(process.env.MAX_CLOUDFLARE_RETRIES ?? 2);
 
 if (!DISCORD_TOKEN) {
   throw new Error("Missing DISCORD_TOKEN in environment variables.");
