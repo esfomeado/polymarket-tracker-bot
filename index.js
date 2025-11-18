@@ -598,25 +598,62 @@ async function placeBuyOrder(tokenId, price, size, orderType = OrderType.GTC) {
 
     logToFile("DEBUG", "Posting buy order", { orderId: order?.salt });
     let response;
-    try {
-      response = await clobClient.postOrder(order, orderType);
-    } catch (postError) {
-      if (
-        postError &&
-        postError.message &&
-        isCloudflareBlock(postError.message)
-      ) {
-        const errorMsg =
-          "Cloudflare is blocking requests. Your server IP may be flagged. Please try again later or contact Polymarket support.";
-        logToFile("ERROR", "Cloudflare block detected (from error)", {
-          tokenId,
-          price,
-          size,
-          errorMessage: postError.message.substring(0, 200),
-        });
-        throw new Error(errorMsg);
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= MAX_CLOUDFLARE_RETRIES; attempt++) {
+      try {
+        if (attempt > 1) {
+          const delay = CLOUDFLARE_RETRY_DELAY_MS * attempt;
+          logToFile(
+            "INFO",
+            `Retrying buy order after Cloudflare block (attempt ${attempt}/${MAX_CLOUDFLARE_RETRIES})`,
+            {
+              delayMs: delay,
+              tokenId,
+            }
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+
+        response = await clobClient.postOrder(order, orderType);
+        break;
+      } catch (postError) {
+        lastError = postError;
+        if (
+          postError &&
+          postError.message &&
+          isCloudflareBlock(postError.message)
+        ) {
+          logToFile(
+            "WARN",
+            `Cloudflare block detected (attempt ${attempt}/${MAX_CLOUDFLARE_RETRIES})`,
+            {
+              tokenId,
+              price,
+              size,
+              attempt,
+              errorMessage: postError.message.substring(0, 200),
+            }
+          );
+
+          if (attempt === MAX_CLOUDFLARE_RETRIES) {
+            const errorMsg =
+              "Cloudflare is blocking CLOB API requests. Your server IP may be flagged. The Data API works, but order placement is blocked. Please contact Polymarket support or try from a different network.";
+            logToFile("ERROR", "Cloudflare block - max retries reached", {
+              tokenId,
+              price,
+              size,
+            });
+            throw new Error(errorMsg);
+          }
+          continue;
+        }
+        throw postError;
       }
-      throw postError;
+    }
+
+    if (!response && lastError) {
+      throw lastError;
     }
 
     if (isCloudflareBlock(response)) {
