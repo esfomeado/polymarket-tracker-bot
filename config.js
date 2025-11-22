@@ -1,0 +1,130 @@
+require("dotenv").config();
+
+const path = require("path");
+
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 15000);
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const COMMAND_PREFIX = process.env.COMMAND_PREFIX ?? "!";
+const START_COMMAND = `${COMMAND_PREFIX}start`;
+const STOP_COMMAND = `${COMMAND_PREFIX}stop`;
+const BUY_COMMAND = `${COMMAND_PREFIX}buy`;
+const SELL_COMMAND = `${COMMAND_PREFIX}sell`;
+const BALANCE_COMMAND = `${COMMAND_PREFIX}balance`;
+const PAPER_BALANCE_COMMAND = `${COMMAND_PREFIX}paperbalance`;
+const PAPER_RESET_COMMAND = `${COMMAND_PREFIX}paperreset`;
+const PAPER_CLOSE_COMMAND = `${COMMAND_PREFIX}paperclose`;
+const ALERT_ROLE_ID = process.env.ALERT_ROLE_ID;
+
+const POLYMARKET_PRIVATE_KEY = process.env.POLYMARKET_PRIVATE_KEY;
+const POLYMARKET_FUNDER = process.env.POLYMARKET_FUNDER;
+const POLYMARKET_SIGNATURE_TYPE = Number(
+  process.env.POLYMARKET_SIGNATURE_TYPE ?? 1
+);
+const AUTO_TRADE_ENABLED = process.env.AUTO_TRADE_ENABLED === "true";
+const AUTO_TRADE_FILTER = process.env.AUTO_TRADE_FILTER;
+const AUTO_TRADE_AMOUNT_USD = Number(process.env.AUTO_TRADE_AMOUNT_USD ?? 1);
+const AUTO_TRADE_USE_MARKET = process.env.AUTO_TRADE_USE_MARKET === "true";
+const MAX_ORDER_VALUE_USD = Number(process.env.MAX_ORDER_VALUE_USD ?? 10);
+const BIG_TRADE_THRESHOLD_USD = Number(
+  process.env.BIG_TRADE_THRESHOLD_USD ?? 10
+);
+const CLOUDFLARE_RETRY_DELAY_MS = Number(
+  process.env.CLOUDFLARE_RETRY_DELAY_MS ?? 60000
+);
+const MAX_CLOUDFLARE_RETRIES = Number(process.env.MAX_CLOUDFLARE_RETRIES ?? 2);
+const MAX_POSITIONS = Number(process.env.MAX_POSITIONS ?? 20);
+const MAX_TOTAL_EXPOSURE_USD = Number(process.env.MAX_TOTAL_EXPOSURE_USD ?? 0);
+const MAX_BET_AMOUNT_PER_MARKET_USD = Number(
+  process.env.MAX_BET_AMOUNT_PER_MARKET_USD ?? 0
+);
+const HIGH_CONFIDENCE_THRESHOLD_USD = Number(
+  process.env.HIGH_CONFIDENCE_THRESHOLD_USD ?? 50
+);
+const LOW_CONFIDENCE_THRESHOLD_USD = Number(
+  process.env.LOW_CONFIDENCE_THRESHOLD_USD ?? 10
+);
+const MIN_TRACKED_TRADE_SIZE_USD = Number(
+  process.env.MIN_TRACKED_TRADE_SIZE_USD ?? 0
+);
+const MIN_TRACKED_CONFIDENCE_LEVEL = Number(
+  process.env.MIN_TRACKED_CONFIDENCE_LEVEL ?? 0
+);
+const PAPER_TRADING_ENABLED = process.env.PAPER_TRADING_ENABLED === "true";
+const PAPER_TRADING_INITIAL_BALANCE = Number(
+  process.env.PAPER_TRADING_INITIAL_BALANCE ?? 200
+);
+const POLY_WS_API_KEY = process.env.POLY_WS_API_KEY;
+const POLY_WS_API_SECRET = process.env.POLY_WS_API_SECRET;
+const POLY_WS_API_PASSPHRASE = process.env.POLY_WS_API_PASSPHRASE;
+const SEND_TRADES_ONLY = process.env.SEND_TRADES_ONLY !== "false";
+
+if (!DISCORD_TOKEN) {
+  throw new Error("Missing DISCORD_TOKEN in environment variables.");
+}
+
+if (!Number.isFinite(POLL_INTERVAL_MS) || POLL_INTERVAL_MS < 5000) {
+  throw new Error("POLL_INTERVAL_MS must be a number >= 5000.");
+}
+
+const POLYGON_RPC = process.env.POLYGON_RPC || "https://polygon-rpc.com";
+const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const CLOB_EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+const DEFAULT_WALLET = "0x0f37cb80dee49d55b5f6d9e595d52591d6371410";
+
+const USDC_ABI = [
+  "function balanceOf(address owner) view returns (uint256)",
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+];
+
+const LOG_FILE = path.join(__dirname, "bot.log");
+const PAPER_TRADING_STATE_FILE = path.join(
+  __dirname,
+  "paper-trading-state.json"
+);
+
+module.exports = {
+  POLL_INTERVAL_MS,
+  DISCORD_TOKEN,
+  COMMAND_PREFIX,
+  START_COMMAND,
+  STOP_COMMAND,
+  BUY_COMMAND,
+  SELL_COMMAND,
+  BALANCE_COMMAND,
+  PAPER_BALANCE_COMMAND,
+  PAPER_RESET_COMMAND,
+  PAPER_CLOSE_COMMAND,
+  ALERT_ROLE_ID,
+  POLYMARKET_PRIVATE_KEY,
+  POLYMARKET_FUNDER,
+  POLYMARKET_SIGNATURE_TYPE,
+  AUTO_TRADE_ENABLED,
+  AUTO_TRADE_FILTER,
+  AUTO_TRADE_AMOUNT_USD,
+  AUTO_TRADE_USE_MARKET,
+  MAX_ORDER_VALUE_USD,
+  BIG_TRADE_THRESHOLD_USD,
+  CLOUDFLARE_RETRY_DELAY_MS,
+  MAX_CLOUDFLARE_RETRIES,
+  MAX_POSITIONS,
+  MAX_TOTAL_EXPOSURE_USD,
+  MAX_BET_AMOUNT_PER_MARKET_USD,
+  HIGH_CONFIDENCE_THRESHOLD_USD,
+  LOW_CONFIDENCE_THRESHOLD_USD,
+  MIN_TRACKED_TRADE_SIZE_USD,
+  MIN_TRACKED_CONFIDENCE_LEVEL,
+  PAPER_TRADING_ENABLED,
+  PAPER_TRADING_INITIAL_BALANCE,
+  POLY_WS_API_KEY,
+  POLY_WS_API_SECRET,
+  POLY_WS_API_PASSPHRASE,
+  SEND_TRADES_ONLY,
+  POLYGON_RPC,
+  USDC_ADDRESS,
+  CLOB_EXCHANGE_ADDRESS,
+  DEFAULT_WALLET,
+  USDC_ABI,
+  LOG_FILE,
+  PAPER_TRADING_STATE_FILE,
+};
