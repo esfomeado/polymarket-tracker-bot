@@ -761,13 +761,15 @@ client.on("messageCreate", async (message) => {
       const closedTrades = paperTradingState.tradeHistory.filter(
         (trade) =>
           (trade.side === "MANUAL_CLOSE" ||
-            trade.side === "AUTO_CLOSE_WIN" ||
-            trade.side === "AUTO_CLOSE_LOSS" ||
-            trade.side === "SETTLEMENT") &&
+            trade.side === "SETTLEMENT" ||
+            trade.side === "STOP_LOSS") &&
           trade.pnl !== undefined
       );
       const wins = closedTrades.filter((trade) => trade.pnl > 0).length;
       const losses = closedTrades.filter((trade) => trade.pnl < 0).length;
+      const stopLossTrades = closedTrades.filter(
+        (trade) => trade.side === "STOP_LOSS"
+      ).length;
       const totalClosed = wins + losses;
       const winrate =
         totalClosed > 0 ? ((wins / totalClosed) * 100).toFixed(2) : "0.00";
@@ -814,7 +816,9 @@ client.on("messageCreate", async (message) => {
           },
           {
             name: "🎯 Winrate",
-            value: `${winrate}% (${wins}W/${losses}L)`,
+            value: `${winrate}% (${wins}W/${losses}L${
+              stopLossTrades > 0 ? `/${stopLossTrades}SL` : ""
+            })`,
             inline: true,
           },
         ],
@@ -876,14 +880,16 @@ client.on("messageCreate", async (message) => {
               const closedTrades = paperTradingState.tradeHistory.filter(
                 (trade) =>
                   (trade.side === "MANUAL_CLOSE" ||
-                    trade.side === "AUTO_CLOSE_WIN" ||
-                    trade.side === "AUTO_CLOSE_LOSS" ||
-                    trade.side === "SETTLEMENT") &&
+                    trade.side === "SETTLEMENT" ||
+                    trade.side === "STOP_LOSS") &&
                   trade.pnl !== undefined
               );
               const wins = closedTrades.filter((trade) => trade.pnl > 0).length;
               const losses = closedTrades.filter(
                 (trade) => trade.pnl < 0
+              ).length;
+              const stopLossTrades = closedTrades.filter(
+                (trade) => trade.side === "STOP_LOSS"
               ).length;
               const totalClosed = wins + losses;
               const winrate =
@@ -899,7 +905,9 @@ client.on("messageCreate", async (message) => {
                   `💚 PnL: $${
                     balance.realizedPnL >= 0 ? "+" : ""
                   }${balance.realizedPnL.toFixed(2)}\n` +
-                  `🎯 Winrate: ${winrate}% (${wins}W/${losses}L)\n` +
+                  `🎯 Winrate: ${winrate}% (${wins}W/${losses}L${
+                    stopLossTrades > 0 ? `/${stopLossTrades}SL` : ""
+                  })\n` +
                   `\n*Full details unavailable due to connection timeout*`
               );
             } catch (fallbackError) {
@@ -1090,42 +1098,42 @@ client.on("messageCreate", async (message) => {
         );
       }
 
-      await message.channel.send(
-        `🔍 Getting current market price for position...`
-      );
-
-      const priceResult = await getCurrentMarketPrice(
-        tokenIdToCheck,
-        orderbookWS,
-        clobClient,
-        clobClientReady
-      );
-
       let settlementPrice = null;
       let priceSource = "market";
 
-      if (
-        priceResult === null ||
-        priceResult.price === undefined ||
-        isNaN(priceResult.price)
-      ) {
-        if (outcomeOverride === "win") {
-          settlementPrice = 1.0;
-          priceSource = "manual (win)";
-          logToFile("INFO", "Using manual win settlement", {
-            tokenId: tokenId.substring(0, 10) + "...",
-            market: position.market,
-            outcome: position.outcome,
-          });
-        } else if (outcomeOverride === "loss") {
-          settlementPrice = 0.0;
-          priceSource = "manual (loss)";
-          logToFile("INFO", "Using manual loss settlement", {
-            tokenId: tokenId.substring(0, 10) + "...",
-            market: position.market,
-            outcome: position.outcome,
-          });
-        } else {
+      if (outcomeOverride === "win") {
+        settlementPrice = 1.0;
+        priceSource = "manual (win)";
+        logToFile("INFO", "Using manual win settlement (override)", {
+          tokenId: tokenId.substring(0, 10) + "...",
+          market: position.market,
+          outcome: position.outcome,
+        });
+      } else if (outcomeOverride === "loss") {
+        settlementPrice = 0.0;
+        priceSource = "manual (loss)";
+        logToFile("INFO", "Using manual loss settlement (override)", {
+          tokenId: tokenId.substring(0, 10) + "...",
+          market: position.market,
+          outcome: position.outcome,
+        });
+      } else {
+        await message.channel.send(
+          `🔍 Getting current market price for position...`
+        );
+
+        const priceResult = await getCurrentMarketPrice(
+          tokenIdToCheck,
+          orderbookWS,
+          clobClient,
+          clobClientReady
+        );
+
+        if (
+          priceResult === null ||
+          priceResult.price === undefined ||
+          isNaN(priceResult.price)
+        ) {
           await message.channel.send(
             `❌ Could not get current market price. The market may be closed or inactive.\n` +
               `💡 Tip: You can manually close as win or loss:\n` +
@@ -1133,41 +1141,11 @@ client.on("messageCreate", async (message) => {
               `   ${PAPER_CLOSE_COMMAND} ${identifier} loss (settles at $0.00)`
           );
           return;
-        }
-      } else {
-        const currentPrice = priceResult.price;
-        const bestBidSize = priceResult.bestBidSize || 0;
+        } else {
+          const currentPrice = priceResult.price;
 
-        const entryPrice = position.avgPrice || 0;
-        const priceSum = entryPrice + currentPrice;
-        const priceChange = Math.abs(currentPrice - entryPrice);
-
-        const isInverted =
-          (priceSum > 0.95 && priceSum < 1.05 && priceChange > 0.3) ||
-          (entryPrice > 0.5 && currentPrice < 0.1) ||
-          (entryPrice < 0.1 && currentPrice > 0.9) ||
-          (entryPrice > 0.5 && currentPrice < 0.1 && bestBidSize > 1000);
-
-        settlementPrice = currentPrice;
-
-        if (isInverted) {
-          settlementPrice = 1.0 - currentPrice;
-          priceSource = "market (inverted)";
-          logToFile(
-            "WARN",
-            "Price inversion detected in manual close - using inverse price",
-            {
-              tokenId: tokenId.substring(0, 10) + "...",
-              outcome: position.outcome,
-              entryPrice,
-              originalPrice: currentPrice,
-              correctedPrice: settlementPrice,
-              priceSum,
-              priceChange,
-              bestBidSize,
-              note: "Detected price inversion - using inverse price (1 - original) as we likely got the opposite token's orderbook. Many shares at low price when entry was high confirms wrong token.",
-            }
-          );
+          settlementPrice = currentPrice;
+          priceSource = "market";
         }
       }
       const pnl = position.shares * (settlementPrice - position.avgPrice);

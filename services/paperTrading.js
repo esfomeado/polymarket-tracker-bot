@@ -248,8 +248,15 @@ function getPaperTradingBalance() {
 
   let wins = 0;
   let losses = 0;
+  let stopLosses = 0;
   paperTradingState.tradeHistory.forEach((trade) => {
-    if (trade.side === "MANUAL_CLOSE" && trade.pnl !== undefined) {
+    if (
+      (trade.side === "MANUAL_CLOSE" || trade.side === "STOP_LOSS") &&
+      trade.pnl !== undefined
+    ) {
+      if (trade.side === "STOP_LOSS") {
+        stopLosses++;
+      }
       if (trade.pnl > 0) {
         wins++;
       } else if (trade.pnl < 0) {
@@ -271,6 +278,7 @@ function getPaperTradingBalance() {
     winRate,
     wins,
     losses,
+    stopLosses,
   };
 }
 

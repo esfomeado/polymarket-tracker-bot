@@ -183,6 +183,23 @@ async function getCurrentMarketPrice(
 
     if (orderbookWS && orderbookWS.isConnected) {
       orderbookWS.subscribe(tokenId);
+
+      const lastTrade = orderbookWS.getLastTradePrice(tokenId);
+      if (lastTrade && Date.now() - lastTrade.timestamp < 30000) {
+        logToFile("INFO", "Using last trade price from WebSocket (immediate)", {
+          tokenId: tokenId.substring(0, 10) + "...",
+          fullTokenId: tokenId,
+          price: lastTrade.price,
+          age: Date.now() - lastTrade.timestamp,
+        });
+        return {
+          price: lastTrade.price,
+          bestBidSize: lastTrade.size || 0,
+          source: "websocket_last_trade",
+          isLastTrade: true,
+        };
+      }
+
       const wsOrderbook = orderbookWS.getOrderbook(tokenId);
       if (wsOrderbook && Date.now() - wsOrderbook.timestamp < 5000) {
         orderBook = {
@@ -190,6 +207,69 @@ async function getCurrentMarketPrice(
           bids: wsOrderbook.bids,
         };
         orderBookSource = "websocket";
+        logToFile("INFO", "Using WebSocket orderbook (cached)", {
+          tokenId: tokenId.substring(0, 10) + "...",
+          age: Date.now() - wsOrderbook.timestamp,
+        });
+      } else {
+        const maxWait = 1000;
+        const checkInterval = 100;
+        let waited = 0;
+
+        while (waited < maxWait && !orderBook) {
+          await new Promise((resolve) => setTimeout(resolve, checkInterval));
+          waited += checkInterval;
+
+          const lastTradeCheck = orderbookWS.getLastTradePrice(tokenId);
+          if (lastTradeCheck && Date.now() - lastTradeCheck.timestamp < 30000) {
+            logToFile(
+              "INFO",
+              "Using last trade price from WebSocket (after wait)",
+              {
+                tokenId: tokenId.substring(0, 10) + "...",
+                fullTokenId: tokenId,
+                price: lastTradeCheck.price,
+                waitTime: waited,
+                age: Date.now() - lastTradeCheck.timestamp,
+              }
+            );
+            return {
+              price: lastTradeCheck.price,
+              bestBidSize: lastTradeCheck.size || 0,
+              source: "websocket_last_trade",
+              isLastTrade: true,
+            };
+          }
+
+          const wsOrderbookCheck = orderbookWS.getOrderbook(tokenId);
+          if (
+            wsOrderbookCheck &&
+            Date.now() - wsOrderbookCheck.timestamp < 5000
+          ) {
+            orderBook = {
+              asks: wsOrderbookCheck.asks,
+              bids: wsOrderbookCheck.bids,
+            };
+            orderBookSource = "websocket";
+            logToFile("INFO", "Using WebSocket orderbook (after wait)", {
+              tokenId: tokenId.substring(0, 10) + "...",
+              waitTime: waited,
+              age: Date.now() - wsOrderbookCheck.timestamp,
+            });
+            break;
+          }
+        }
+
+        if (!orderBook) {
+          logToFile(
+            "INFO",
+            "WebSocket orderbook not available, will use REST",
+            {
+              tokenId: tokenId.substring(0, 10) + "...",
+              waited,
+            }
+          );
+        }
       }
     }
 
@@ -223,6 +303,27 @@ async function getCurrentMarketPrice(
       return null;
     }
 
+    if (orderbookWS && orderbookWS.isConnected) {
+      const lastTrade = orderbookWS.getLastTradePrice(tokenId);
+      if (lastTrade && Date.now() - lastTrade.timestamp < 30000) {
+        logToFile("INFO", "Using last trade price from WebSocket", {
+          tokenId: tokenId.substring(0, 10) + "...",
+          fullTokenId: tokenId,
+          price: lastTrade.price,
+          side: lastTrade.side,
+          size: lastTrade.size,
+          age: Date.now() - lastTrade.timestamp,
+          source: "websocket_last_trade",
+        });
+        return {
+          price: lastTrade.price,
+          bestBidSize: lastTrade.size || 0,
+          source: "websocket_last_trade",
+          isLastTrade: true,
+        };
+      }
+    }
+
     if (orderBook && orderBook.bids && orderBook.bids.length > 0) {
       const bestBid = orderBook.bids[0];
       if (bestBid && bestBid.price) {
@@ -240,7 +341,12 @@ async function getCurrentMarketPrice(
               .slice(0, 3)
               .map((b) => ({ price: b.price, size: b.size })),
           });
-          return { price, bestBidSize: parseFloat(bestBid.size) || 0 };
+          return {
+            price,
+            bestBidSize: parseFloat(bestBid.size) || 0,
+            source: orderBookSource,
+            isLastTrade: false,
+          };
         } else {
           logToFile("WARN", "Best bid price is invalid", {
             tokenId: tokenId.substring(0, 10) + "...",

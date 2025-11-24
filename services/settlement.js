@@ -1,11 +1,202 @@
 const fetch = require("node-fetch");
-const { PAPER_TRADING_ENABLED } = require("../config");
+const {
+  PAPER_TRADING_ENABLED,
+  STOP_LOSS_ENABLED,
+  STOP_LOSS_PERCENTAGE,
+  STOP_LOSS_CHECK_INTERVAL_MS,
+} = require("../config");
 const { logToFile } = require("../utils/logger");
 const {
   getPaperTradingState,
   setPaperTradingState,
+  paperSell,
 } = require("./paperTrading");
 const { getTokenIdForOutcome, getCurrentMarketPrice } = require("./marketData");
+
+async function checkStopLossForRealPositions(
+  activeChannel,
+  orderbookWS,
+  clobClient,
+  clobClientReady,
+  getCurrentPositions,
+  placeMarketSellOrder,
+  provider,
+  signer
+) {
+  if (!STOP_LOSS_ENABLED || !clobClient || !clobClientReady || !activeChannel) {
+    return;
+  }
+
+  try {
+    const positions = await getCurrentPositions();
+    if (!Array.isArray(positions) || positions.length === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    const stopLossThreshold = STOP_LOSS_PERCENTAGE / 100;
+
+    for (const pos of positions) {
+      const tokenId = pos.token_id || pos.conditionId || pos.tokenID;
+      if (!tokenId) continue;
+
+      const lastChecked = pos.lastChecked || 0;
+      const checkInterval = Math.min(STOP_LOSS_CHECK_INTERVAL_MS, 300000);
+      if (now - lastChecked < checkInterval) {
+        continue;
+      }
+
+      try {
+        const priceResult = await getCurrentMarketPrice(
+          tokenId,
+          orderbookWS,
+          clobClient,
+          clobClientReady
+        );
+
+        if (
+          !priceResult ||
+          priceResult.price === undefined ||
+          isNaN(priceResult.price) ||
+          priceResult.price < 0 ||
+          priceResult.price > 1
+        ) {
+          continue;
+        }
+
+        const currentPrice = priceResult.price;
+        const entryPrice =
+          pos.avgPrice || pos.price || pos.cost / (pos.shares || 1);
+        const shares = pos.shares || pos.size || 0;
+
+        if (entryPrice <= 0 || shares <= 0) {
+          continue;
+        }
+
+        const lossPercentage = ((entryPrice - currentPrice) / entryPrice) * 100;
+        const stopLossPrice = entryPrice * (1 - stopLossThreshold);
+
+        if (
+          currentPrice <= stopLossPrice &&
+          lossPercentage >= STOP_LOSS_PERCENTAGE
+        ) {
+          logToFile("WARN", "Stop-loss triggered for real position", {
+            tokenId: tokenId.substring(0, 10) + "...",
+            entryPrice,
+            currentPrice,
+            lossPercentage: lossPercentage.toFixed(2),
+            shares,
+            stopLossThreshold: STOP_LOSS_PERCENTAGE,
+          });
+
+          try {
+            const stopLossPrice = entryPrice * (1 - stopLossThreshold);
+
+            const { placeSellOrder } = require("./orders");
+            const sellResult = await placeSellOrder(
+              tokenId,
+              stopLossPrice,
+              shares,
+              "GTC",
+              clobClient,
+              clobClientReady
+            );
+
+            if (sellResult && !sellResult.error) {
+              await activeChannel.send({
+                embeds: [
+                  {
+                    title: "🛑 Stop-Loss Triggered (Real Trading)",
+                    description: `Position hit stop-loss threshold (${lossPercentage.toFixed(
+                      1
+                    )}% loss). Limit order placed at stop-loss price.`,
+                    color: 0xff6600,
+                    fields: [
+                      {
+                        name: "Shares Sold",
+                        value: `${shares.toFixed(2)}`,
+                        inline: true,
+                      },
+                      {
+                        name: "Entry Price",
+                        value: `$${entryPrice.toFixed(4)} (${(
+                          entryPrice * 100
+                        ).toFixed(1)}¢)`,
+                        inline: true,
+                      },
+                      {
+                        name: "Stop-Loss Price",
+                        value: `$${stopLossPrice.toFixed(4)} (${(
+                          stopLossPrice * 100
+                        ).toFixed(2)}¢)`,
+                        inline: true,
+                      },
+                      {
+                        name: "Current Market",
+                        value: `$${currentPrice.toFixed(4)} (${(
+                          currentPrice * 100
+                        ).toFixed(2)}¢)`,
+                        inline: true,
+                      },
+                      {
+                        name: "Loss %",
+                        value: `${lossPercentage.toFixed(1)}%`,
+                        inline: true,
+                      },
+                      {
+                        name: "Order Type",
+                        value: "Limit Order",
+                        inline: true,
+                      },
+                      {
+                        name: "Order ID",
+                        value: sellResult.orderId || "Pending",
+                        inline: true,
+                      },
+                    ],
+                    timestamp: new Date().toISOString(),
+                  },
+                ],
+              });
+
+              logToFile("INFO", "Real position stop-loss executed", {
+                tokenId,
+                entryPrice,
+                exitPrice: stopLossPrice,
+                lossPercentage,
+                shares,
+                orderId: sellResult.orderId,
+              });
+            } else {
+              logToFile(
+                "ERROR",
+                "Failed to execute stop-loss sell for real position",
+                {
+                  tokenId,
+                  error: sellResult?.error || "Unknown error",
+                }
+              );
+            }
+          } catch (sellError) {
+            logToFile("ERROR", "Exception executing stop-loss sell", {
+              tokenId,
+              error: sellError.message,
+            });
+          }
+        }
+      } catch (error) {
+        logToFile("WARN", "Failed to check stop-loss for position", {
+          tokenId,
+          error: error.message,
+        });
+      }
+    }
+  } catch (error) {
+    logToFile("ERROR", "Failed to check stop-loss for real positions", {
+      error: error.message,
+    });
+  }
+}
 
 async function checkAndSettleResolvedMarkets(
   activeChannel,
@@ -20,16 +211,20 @@ async function checkAndSettleResolvedMarkets(
   const paperTradingState = getPaperTradingState();
   const now = Date.now();
   const positionsToCheck = Object.entries(paperTradingState.positions);
-  const HIGH_PRICE_THRESHOLD = 0.999;
-  const LOW_PRICE_THRESHOLD = 0.001;
+
+  const checkInterval = STOP_LOSS_ENABLED
+    ? Math.min(STOP_LOSS_CHECK_INTERVAL_MS, 300000)
+    : 300000;
 
   for (const [tokenId, position] of positionsToCheck) {
-    if (position.lastChecked && now - position.lastChecked < 300000) {
+    if (position.lastChecked && now - position.lastChecked < checkInterval) {
       continue;
     }
 
     try {
       let tokenIdToCheck = tokenId;
+      let correctTokenId = null;
+      let tokenIdVerified = false;
 
       if (position.conditionId && position.outcome) {
         logToFile("INFO", "Verifying tokenId for auto-close check", {
@@ -38,7 +233,7 @@ async function checkAndSettleResolvedMarkets(
           outcome: position.outcome,
         });
 
-        const correctTokenId = await getTokenIdForOutcome(
+        correctTokenId = await getTokenIdForOutcome(
           position.conditionId,
           position.outcome
         );
@@ -56,18 +251,21 @@ async function checkAndSettleResolvedMarkets(
             }
           );
           tokenIdToCheck = correctTokenId;
+          tokenIdVerified = true;
         } else if (correctTokenId === tokenId) {
           logToFile("INFO", "TokenId verified - matches outcome", {
             tokenId: tokenId.substring(0, 10) + "...",
             outcome: position.outcome,
           });
+          tokenIdVerified = true;
         } else if (!correctTokenId) {
           logToFile("WARN", "Could not find correct tokenId for outcome", {
             tokenId: tokenId.substring(0, 10) + "...",
             conditionId: position.conditionId,
             outcome: position.outcome,
-            note: "Will use stored tokenId, but price may be incorrect if it's the wrong token",
+            note: "Cannot verify tokenId - will skip stop-loss check to avoid checking wrong token.",
           });
+          tokenIdVerified = false;
         }
       } else {
         logToFile(
@@ -77,9 +275,10 @@ async function checkAndSettleResolvedMarkets(
             tokenId: tokenId.substring(0, 10) + "...",
             hasConditionId: !!position.conditionId,
             hasOutcome: !!position.outcome,
-            note: "Cannot verify tokenId - position may have been created before outcome tracking was added",
+            note: "Cannot verify tokenId - will skip stop-loss check to avoid checking wrong token",
           }
         );
+        tokenIdVerified = false;
       }
 
       logToFile("INFO", "Checking price for paper position", {
@@ -106,227 +305,218 @@ async function checkAndSettleResolvedMarkets(
       ) {
         const currentPrice = priceResult.price;
         const bestBidSize = priceResult.bestBidSize || 0;
-        logToFile("INFO", "Checking position price for auto-close", {
+        logToFile("INFO", "Checking position price", {
           tokenId: tokenId.substring(0, 10) + "...",
           market: position.market,
           outcome: position.outcome,
           currentPrice,
           bestBidSize,
           entryPrice: position.avgPrice,
-          highThreshold: HIGH_PRICE_THRESHOLD,
-          lowThreshold: LOW_PRICE_THRESHOLD,
         });
 
         const entryPrice = position.avgPrice || 0;
-        const priceSum = entryPrice + currentPrice;
-        const priceChange = Math.abs(currentPrice - entryPrice);
-
-        const isInverted =
-          (priceSum > 0.9 && priceSum < 1.1 && priceChange > 0.3) ||
-          (entryPrice > 0.5 && currentPrice < 0.1) ||
-          (entryPrice < 0.1 && currentPrice > 0.9) ||
-          (entryPrice > 0.5 && currentPrice < 0.1 && bestBidSize > 1000) ||
-          (entryPrice > 0.5 && currentPrice > 0.9 && priceChange > 0.3);
-
-        let correctedPrice = currentPrice;
-
-        if (isInverted) {
-          correctedPrice = 1.0 - currentPrice;
-          logToFile(
-            "WARN",
-            "Price inversion detected - correcting to opposite token price",
-            {
-              tokenId: tokenId.substring(0, 10) + "...",
-              fullTokenId: tokenId,
-              market: position.market,
-              outcome: position.outcome,
-              entryPrice,
-              originalPrice: currentPrice,
-              correctedPrice,
-              priceSum,
-              bestBidSize,
-              note: "Detected price inversion - using inverse price (1 - original) as we likely got the opposite token's orderbook. Many shares at low price when entry was high confirms wrong token.",
-            }
-          );
-        }
 
         position.lastChecked = now;
 
-        const priceToCheck = correctedPrice;
+        const mightBeWrongToken =
+          (entryPrice > 0.5 && currentPrice < 0.05) ||
+          (entryPrice < 0.1 && currentPrice > 0.9);
 
-        if (priceToCheck >= HIGH_PRICE_THRESHOLD) {
-          const settlementPrice = 1.0;
-          const pnl = position.shares * (settlementPrice - position.avgPrice);
-          const proceeds = position.shares * settlementPrice;
+        const lossPercentage =
+          entryPrice > 0 ? ((entryPrice - currentPrice) / entryPrice) * 100 : 0;
 
-          paperTradingState.balance += proceeds;
-          paperTradingState.realizedPnL += pnl;
+        const indicatesClearLoss =
+          entryPrice > 0.3 && currentPrice < 0.1 && lossPercentage > 50;
+        const indicatesExtremeLoss =
+          entryPrice > 0.3 && currentPrice < 0.1 && lossPercentage > 80;
 
-          paperTradingState.tradeHistory.push({
-            timestamp: Date.now(),
-            side: "AUTO_CLOSE_WIN",
-            tokenId,
-            shares: position.shares,
-            price: settlementPrice,
-            currentPrice: currentPrice,
-            value: proceeds,
-            pnl: pnl,
+        const canCheckStopLoss =
+          tokenIdVerified ||
+          indicatesExtremeLoss ||
+          (indicatesClearLoss && !mightBeWrongToken) ||
+          (!mightBeWrongToken && currentPrice > 0.05 && currentPrice < 0.95);
+
+        if (
+          STOP_LOSS_ENABLED &&
+          entryPrice > 0 &&
+          !position.stopLossPending &&
+          canCheckStopLoss
+        ) {
+          const priceToCheck = currentPrice;
+          const lossPercentage =
+            ((entryPrice - priceToCheck) / entryPrice) * 100;
+          const stopLossThreshold = STOP_LOSS_PERCENTAGE;
+
+          const isWinning = priceToCheck > 0.9 || priceToCheck >= entryPrice;
+
+          const requiredThreshold = tokenIdVerified
+            ? stopLossThreshold
+            : stopLossThreshold * 1.5;
+
+          const isSignificantLoss =
+            priceToCheck < entryPrice && lossPercentage >= requiredThreshold;
+
+          logToFile("INFO", "Checking stop-loss for position", {
+            tokenId: tokenId.substring(0, 10) + "...",
+            tokenIdToCheck:
+              tokenIdToCheck !== tokenId
+                ? tokenIdToCheck.substring(0, 10) + "..."
+                : tokenId.substring(0, 10) + "...",
             market: position.market,
-          });
-
-          await activeChannel.send({
-            embeds: [
-              {
-                title: "✅ Position Auto-Closed (Win)",
-                description: `Market "${position.market}" reached ${(
-                  priceToCheck * 100
-                ).toFixed(1)}¢ - position automatically closed as win.`,
-                color: 0x00aa00,
-                fields: [
-                  {
-                    name: "Shares",
-                    value: `${position.shares.toFixed(2)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "Entry Price",
-                    value: `$${position.avgPrice.toFixed(4)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "Current Price",
-                    value: `$${priceToCheck.toFixed(4)} (${(
-                      priceToCheck * 100
-                    ).toFixed(1)}¢)`,
-                    inline: true,
-                  },
-                  {
-                    name: "Settlement Price",
-                    value: `$${settlementPrice.toFixed(4)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "Proceeds",
-                    value: `$${proceeds.toFixed(2)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "PnL",
-                    value: `$${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "New Balance",
-                    value: `$${paperTradingState.balance.toFixed(2)}`,
-                    inline: true,
-                  },
-                ],
-                timestamp: new Date().toISOString(),
-              },
-            ],
-          });
-
-          logToFile("INFO", "Paper position auto-closed (win)", {
-            tokenId,
-            market: position.market,
-            shares: position.shares,
-            entryPrice: position.avgPrice,
+            outcome: position.outcome,
+            entryPrice,
             currentPrice: priceToCheck,
-            originalPrice: currentPrice,
-            settlementPrice,
-            pnl,
-            proceeds,
+            lossPercentage: lossPercentage.toFixed(2),
+            stopLossThreshold,
+            requiredThreshold,
+            tokenIdVerified,
+            mightBeWrongToken,
+            indicatesClearLoss,
+            isWinning,
+            isSignificantLoss,
+            willTrigger: isSignificantLoss && !isWinning,
           });
 
-          delete paperTradingState.positions[tokenId];
-          setPaperTradingState(paperTradingState);
-          continue;
-        } else if (priceToCheck <= LOW_PRICE_THRESHOLD) {
-          const settlementPrice = 0.0;
-          const pnl = position.shares * (settlementPrice - position.avgPrice);
-          const proceeds = position.shares * settlementPrice;
+          if (isSignificantLoss && !isWinning) {
+            position.stopLossPending = true;
+            setPaperTradingState(paperTradingState);
 
-          paperTradingState.balance += proceeds;
-          paperTradingState.realizedPnL += pnl;
+            const stopLossPrice = entryPrice * (1 - stopLossThreshold / 100);
+            const actualSellPrice = stopLossPrice;
 
-          paperTradingState.tradeHistory.push({
-            timestamp: Date.now(),
-            side: "AUTO_CLOSE_LOSS",
-            tokenId,
-            shares: position.shares,
-            price: settlementPrice,
-            currentPrice: currentPrice,
-            value: proceeds,
-            pnl: pnl,
-            market: position.market,
-          });
+            logToFile("WARN", "Stop-loss triggered for paper position", {
+              tokenId: tokenId.substring(0, 10) + "...",
+              market: position.market,
+              outcome: position.outcome,
+              entryPrice,
+              currentPrice: priceToCheck,
+              stopLossPrice,
+              actualSellPrice,
+              orderType: "LIMIT (at stop-loss price)",
+              lossPercentage: lossPercentage.toFixed(2),
+              stopLossThreshold,
+              note: "Placing limit order at stop-loss price",
+            });
+            const sharesBeforeSell = position.shares;
 
-          await activeChannel.send({
-            embeds: [
-              {
-                title: "❌ Position Auto-Closed (Loss)",
-                description: `Market "${position.market}" dropped to ${(
-                  currentPrice * 100
-                ).toFixed(2)}¢ - position automatically closed as loss.`,
-                color: 0xaa0000,
-                fields: [
+            const sellResult = await paperSell(
+              tokenId,
+              sharesBeforeSell,
+              actualSellPrice,
+              position.market
+            );
+
+            if (sellResult && !sellResult.error) {
+              const sharesSold = sellResult.shares || sharesBeforeSell;
+              const proceeds =
+                sellResult.proceeds || sharesSold * actualSellPrice;
+              const pnl =
+                sellResult.pnl || (actualSellPrice - entryPrice) * sharesSold;
+
+              const tradeHistory = paperTradingState.tradeHistory;
+              const lastTrade = tradeHistory[tradeHistory.length - 1];
+              if (
+                lastTrade &&
+                lastTrade.tokenId === tokenId &&
+                lastTrade.side === "SELL"
+              ) {
+                lastTrade.side = "STOP_LOSS";
+                lastTrade.stopLossTriggered = true;
+                lastTrade.lossPercentage = lossPercentage;
+              }
+
+              await activeChannel.send({
+                embeds: [
                   {
-                    name: "Shares",
-                    value: `${position.shares.toFixed(2)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "Entry Price",
-                    value: `$${position.avgPrice.toFixed(4)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "Current Price",
-                    value: `$${currentPrice.toFixed(4)} (${(
-                      currentPrice * 100
-                    ).toFixed(2)}¢)`,
-                    inline: true,
-                  },
-                  {
-                    name: "Settlement Price",
-                    value: `$${settlementPrice.toFixed(4)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "Proceeds",
-                    value: `$${proceeds.toFixed(2)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "PnL",
-                    value: `$${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`,
-                    inline: true,
-                  },
-                  {
-                    name: "New Balance",
-                    value: `$${paperTradingState.balance.toFixed(2)}`,
-                    inline: true,
+                    title: "🛑 Stop-Loss Triggered",
+                    description: `Position in "${
+                      position.market
+                    }" hit stop-loss threshold (${lossPercentage.toFixed(
+                      1
+                    )}% loss). Position automatically sold at stop-loss price.`,
+                    color: 0xff6600,
+                    fields: [
+                      {
+                        name: "Shares Sold",
+                        value: `${sharesSold.toFixed(2)}`,
+                        inline: true,
+                      },
+                      {
+                        name: "Entry Price",
+                        value: `$${entryPrice.toFixed(4)} (${(
+                          entryPrice * 100
+                        ).toFixed(1)}¢)`,
+                        inline: true,
+                      },
+                      {
+                        name: "Exit Price",
+                        value: `$${actualSellPrice.toFixed(4)} (${(
+                          actualSellPrice * 100
+                        ).toFixed(2)}¢)`,
+                        inline: true,
+                      },
+                      {
+                        name: "Stop-Loss Price",
+                        value: `$${stopLossPrice.toFixed(4)} (${(
+                          stopLossPrice * 100
+                        ).toFixed(2)}¢)`,
+                        inline: true,
+                      },
+                      {
+                        name: "Order Type",
+                        value: "Limit Order",
+                        inline: true,
+                      },
+                      {
+                        name: "Loss %",
+                        value: `${lossPercentage.toFixed(1)}%`,
+                        inline: true,
+                      },
+                      {
+                        name: "Proceeds",
+                        value: `$${proceeds.toFixed(2)}`,
+                        inline: true,
+                      },
+                      {
+                        name: "PnL",
+                        value: `$${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`,
+                        inline: true,
+                      },
+                      {
+                        name: "New Balance",
+                        value: `$${
+                          sellResult.balance ||
+                          paperTradingState.balance.toFixed(2)
+                        }`,
+                        inline: true,
+                      },
+                    ],
+                    timestamp: new Date().toISOString(),
                   },
                 ],
-                timestamp: new Date().toISOString(),
-              },
-            ],
-          });
+              });
 
-          logToFile("INFO", "Paper position auto-closed (loss)", {
-            tokenId,
-            market: position.market,
-            shares: position.shares,
-            entryPrice: position.avgPrice,
-            currentPrice,
-            settlementPrice,
-            pnl,
-            proceeds,
-          });
+              logToFile("INFO", "Paper position stop-loss executed", {
+                tokenId,
+                market: position.market,
+                shares: position.shares,
+                entryPrice,
+                exitPrice: stopLossPrice,
+                lossPercentage,
+                pnl,
+                proceeds,
+              });
 
-          delete paperTradingState.positions[tokenId];
-          setPaperTradingState(paperTradingState);
-          continue;
+              delete paperTradingState.positions[tokenId];
+              setPaperTradingState(paperTradingState);
+              continue;
+            } else {
+              logToFile("ERROR", "Failed to execute stop-loss sell", {
+                tokenId,
+                error: sellResult?.error || "Unknown error",
+              });
+            }
+          }
         }
       }
     } catch (error) {
@@ -464,4 +654,5 @@ async function checkAndSettleResolvedMarkets(
 
 module.exports = {
   checkAndSettleResolvedMarkets,
+  checkStopLossForRealPositions,
 };

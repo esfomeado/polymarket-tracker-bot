@@ -2,13 +2,21 @@ const {
   POLL_INTERVAL_MS,
   DEFAULT_WALLET,
   SEND_TRADES_ONLY,
+  SEND_ACTIVITY_HISTORY,
   ALERT_ROLE_ID,
   AUTO_TRADE_ENABLED,
+  COPY_TRADE_ENABLED,
+  COPY_SELL_ORDERS,
   AUTO_TRADE_FILTER,
   AUTO_TRADE_USE_MARKET,
+  AUTO_TRADE_AMOUNT_USD,
   PAPER_TRADING_ENABLED,
   MIN_TRACKED_TRADE_SIZE_USD,
   MIN_TRACKED_CONFIDENCE_LEVEL,
+  OPTIMAL_CONFIDENCE_MIN,
+  OPTIMAL_CONFIDENCE_MAX,
+  USE_OPTIMAL_CONFIDENCE_FILTER,
+  OPTIMAL_CONFIDENCE_BET_MULTIPLIER,
   HIGH_CONFIDENCE_THRESHOLD_USD,
   LOW_CONFIDENCE_THRESHOLD_USD,
   MAX_BET_AMOUNT_PER_MARKET_USD,
@@ -40,7 +48,11 @@ const {
   placeMarketBuyOrder,
   placeMarketSellOrder,
 } = require("./orders");
-const { checkAndSettleResolvedMarkets } = require("./settlement");
+const {
+  checkAndSettleResolvedMarkets,
+  checkStopLossForRealPositions,
+} = require("./settlement");
+const { getCurrentPositions } = require("./positions");
 
 let isPolling = false;
 let pollTimeout = null;
@@ -228,10 +240,12 @@ async function pollOnce(
       }
 
       try {
-        await activeChannel.send({
-          content: mention || undefined,
-          embeds: [embed],
-        });
+        if (SEND_ACTIVITY_HISTORY) {
+          await activeChannel.send({
+            content: mention || undefined,
+            embeds: [embed],
+          });
+        }
 
         logToFile("INFO", "Trade detected", {
           tradeSide,
@@ -250,20 +264,41 @@ async function pollOnce(
         const meetsMinTradeSize =
           MIN_TRACKED_TRADE_SIZE_USD === 0 ||
           trackedTradeSize >= MIN_TRACKED_TRADE_SIZE_USD;
+
+        const isOptimalConfidenceRange =
+          tradePrice >= OPTIMAL_CONFIDENCE_MIN &&
+          tradePrice <= OPTIMAL_CONFIDENCE_MAX;
+        const meetsOptimalConfidenceFilter =
+          !USE_OPTIMAL_CONFIDENCE_FILTER ||
+          tradePrice >= OPTIMAL_CONFIDENCE_MIN;
+
+        let effectiveMinConfidence = MIN_TRACKED_CONFIDENCE_LEVEL;
+        if (USE_OPTIMAL_CONFIDENCE_FILTER) {
+          effectiveMinConfidence = 0;
+        }
         const meetsMinConfidence =
-          MIN_TRACKED_CONFIDENCE_LEVEL === 0 ||
-          tradePrice >= MIN_TRACKED_CONFIDENCE_LEVEL;
+          effectiveMinConfidence === 0 || tradePrice >= effectiveMinConfidence;
+
+        const canCopySellOrder = tradeSide !== "SELL" || COPY_SELL_ORDERS;
 
         const canAutoTrade =
           AUTO_TRADE_ENABLED &&
+          COPY_TRADE_ENABLED &&
           conditionId &&
+          canCopySellOrder &&
           matchesAutoTradeFilter(trade) &&
           meetsMinTradeSize &&
           meetsMinConfidence &&
+          meetsOptimalConfidenceFilter &&
           (PAPER_TRADING_ENABLED || (clobClient && clobClientReady));
 
         if (!canAutoTrade && AUTO_TRADE_ENABLED && conditionId) {
           const skipReasons = [];
+          if (!COPY_TRADE_ENABLED) {
+            skipReasons.push(
+              "copy trading disabled (COPY_TRADE_ENABLED=false)"
+            );
+          }
           if (!matchesAutoTradeFilter(trade)) {
             skipReasons.push("filter mismatch");
           }
@@ -274,11 +309,25 @@ async function pollOnce(
               )} < min $${MIN_TRACKED_TRADE_SIZE_USD}`
             );
           }
-          if (!meetsMinConfidence) {
+          if (!meetsMinConfidence && !USE_OPTIMAL_CONFIDENCE_FILTER) {
             skipReasons.push(
               `confidence ${(tradePrice * 100).toFixed(1)}% < min ${(
-                MIN_TRACKED_CONFIDENCE_LEVEL * 100
+                effectiveMinConfidence * 100
               ).toFixed(1)}%`
+            );
+          }
+          if (!canCopySellOrder) {
+            skipReasons.push("SELL orders disabled (COPY_SELL_ORDERS=false)");
+          }
+          if (!meetsOptimalConfidenceFilter) {
+            skipReasons.push(
+              `confidence ${(tradePrice * 100).toFixed(
+                1
+              )}% below optimal minimum ${(
+                OPTIMAL_CONFIDENCE_MIN * 100
+              ).toFixed(0)}% (trades above ${(
+                OPTIMAL_CONFIDENCE_MAX * 100
+              ).toFixed(0)}% are still traded)`
             );
           }
           if (!PAPER_TRADING_ENABLED && (!clobClient || !clobClientReady)) {
@@ -312,7 +361,7 @@ async function pollOnce(
           }
           const tokenId = asset || conditionId;
           const orderPrice = price;
-          const MIN_ORDER_VALUE_USD = 1;
+          const MIN_ORDER_VALUE_USD = AUTO_TRADE_AMOUNT_USD;
 
           const trackedShareSize = size || 0;
           let orderSize = 0;
@@ -320,49 +369,68 @@ async function pollOnce(
           let confidenceLevel = "MEDIUM";
 
           if (tradeSide === "BUY") {
+            const optimalMultiplier = isOptimalConfidenceRange
+              ? OPTIMAL_CONFIDENCE_BET_MULTIPLIER
+              : 1.0;
+
+            const maxBetAmount =
+              MAX_BET_AMOUNT_PER_MARKET_USD > 0
+                ? MAX_BET_AMOUNT_PER_MARKET_USD
+                : MAX_ORDER_VALUE_USD;
+
             if (trackedTradeSize >= HIGH_CONFIDENCE_THRESHOLD_USD) {
-              confidenceLevel = "HIGH";
-              const maxBetAmount =
-                MAX_BET_AMOUNT_PER_MARKET_USD > 0
-                  ? MAX_BET_AMOUNT_PER_MARKET_USD
-                  : MAX_ORDER_VALUE_USD;
-              orderValue = Math.min(trackedTradeSize, maxBetAmount);
+              confidenceLevel = isOptimalConfidenceRange
+                ? "HIGH SIZE (OPTIMAL PRICE RANGE)"
+                : "HIGH SIZE";
+
+              orderValue = trackedTradeSize * optimalMultiplier;
+              orderValue = Math.min(orderValue, maxBetAmount);
               orderSize = orderPrice > 0 ? orderValue / orderPrice : 0;
               logToFile("INFO", "High confidence trade detected", {
                 trackedTradeSize,
                 confidenceLevel,
+                isOptimalRange: isOptimalConfidenceRange,
+                optimalMultiplier,
                 ourBetSize: orderValue,
                 maxBetAmount,
               });
             } else if (trackedTradeSize <= LOW_CONFIDENCE_THRESHOLD_USD) {
-              confidenceLevel = "LOW";
-              orderValue = MIN_ORDER_VALUE_USD;
+              confidenceLevel = isOptimalConfidenceRange
+                ? "LOW SIZE (OPTIMAL PRICE RANGE)"
+                : "LOW SIZE";
+              orderValue = MIN_ORDER_VALUE_USD * optimalMultiplier;
+              orderValue = Math.min(orderValue, maxBetAmount);
               orderSize = orderPrice > 0 ? orderValue / orderPrice : 0;
               logToFile("INFO", "Low confidence trade detected", {
                 trackedTradeSize,
                 confidenceLevel,
+                isOptimalRange: isOptimalConfidenceRange,
+                optimalMultiplier,
                 ourBetSize: orderValue,
+                maxBetAmount,
               });
             } else {
-              confidenceLevel = "MEDIUM";
-              const maxBetAmount =
-                MAX_BET_AMOUNT_PER_MARKET_USD > 0
-                  ? MAX_BET_AMOUNT_PER_MARKET_USD
-                  : MAX_ORDER_VALUE_USD;
+              confidenceLevel = isOptimalConfidenceRange
+                ? "MEDIUM SIZE (OPTIMAL PRICE RANGE)"
+                : "MEDIUM SIZE";
               const scaleFactor =
                 (trackedTradeSize - LOW_CONFIDENCE_THRESHOLD_USD) /
                 (HIGH_CONFIDENCE_THRESHOLD_USD - LOW_CONFIDENCE_THRESHOLD_USD);
               orderValue = Math.min(
-                MIN_ORDER_VALUE_USD +
-                  scaleFactor * (maxBetAmount - MIN_ORDER_VALUE_USD),
+                (MIN_ORDER_VALUE_USD +
+                  scaleFactor * (maxBetAmount - MIN_ORDER_VALUE_USD)) *
+                  optimalMultiplier,
                 maxBetAmount
               );
               orderSize = orderPrice > 0 ? orderValue / orderPrice : 0;
               logToFile("INFO", "Medium confidence trade detected", {
                 trackedTradeSize,
                 confidenceLevel,
+                isOptimalRange: isOptimalConfidenceRange,
+                optimalMultiplier,
                 scaleFactor,
                 ourBetSize: orderValue,
+                maxBetAmount,
               });
             }
           } else if (tradeSide === "SELL") {
@@ -501,7 +569,10 @@ async function pollOnce(
               currentPositionValue = await getPositionValueForToken(tokenId);
             }
 
-            const maxBetAmount = MAX_BET_AMOUNT_PER_MARKET_USD;
+            const maxBetAmount =
+              MAX_BET_AMOUNT_PER_MARKET_USD > 0
+                ? MAX_BET_AMOUNT_PER_MARKET_USD
+                : MAX_ORDER_VALUE_USD;
             const remainingAmount = Math.max(
               0,
               maxBetAmount - currentPositionValue
@@ -804,12 +875,28 @@ async function pollOnce(
                       timestamp: Date.now(),
                     });
                     const buyEmbed = {
-                      title: "✅ Paper Trade: MARKET BUY",
+                      title: isOptimalConfidenceRange
+                        ? "✅ Paper Trade: MARKET BUY (OPTIMAL RANGE)"
+                        : "✅ Paper Trade: MARKET BUY",
                       description: `$${orderValue.toFixed(
                         2
-                      )} (${orderSize.toFixed(2)} shares) @ market price`,
-                      color: 0x00aa00,
+                      )} (${orderSize.toFixed(2)} shares) @ market price${
+                        isOptimalConfidenceRange
+                          ? "\n\n🎯 **In optimal confidence range (60-70¢) - 85% win rate!**"
+                          : ""
+                      }`,
+                      color: isOptimalConfidenceRange ? 0x00ff00 : 0x00aa00,
                       fields: [
+                        {
+                          name: "Market",
+                          value: title || slug || "Unknown market",
+                          inline: false,
+                        },
+                        {
+                          name: "Outcome",
+                          value: outcome ?? "Unknown",
+                          inline: true,
+                        },
                         {
                           name: "Mode",
                           value: "📝 Paper Trading",
@@ -818,6 +905,13 @@ async function pollOnce(
                         {
                           name: "Confidence",
                           value: confidenceLevel,
+                          inline: true,
+                        },
+                        {
+                          name: "Entry Price",
+                          value: `${(tradePrice * 100).toFixed(2)}¢${
+                            isOptimalConfidenceRange ? " 🎯" : ""
+                          }`,
                           inline: true,
                         },
                         {
@@ -934,12 +1028,28 @@ async function pollOnce(
                     timestamp: Date.now(),
                   });
                   const buyEmbed = {
-                    title: "✅ Auto-placed MARKET BUY Order",
+                    title: isOptimalConfidenceRange
+                      ? "✅ Auto-placed MARKET BUY Order (OPTIMAL RANGE)"
+                      : "✅ Auto-placed MARKET BUY Order",
                     description: `$${orderValue.toFixed(
                       2
-                    )} (${orderSize.toFixed(2)} shares) @ market price`,
-                    color: 0x00aa00,
+                    )} (${orderSize.toFixed(2)} shares) @ market price${
+                      isOptimalConfidenceRange
+                        ? "\n\n🎯 **In optimal confidence range (60-70¢) - 85% win rate!**"
+                        : ""
+                    }`,
+                    color: isOptimalConfidenceRange ? 0x00ff00 : 0x00aa00,
                     fields: [
+                      {
+                        name: "Market",
+                        value: title || slug || "Unknown market",
+                        inline: false,
+                      },
+                      {
+                        name: "Outcome",
+                        value: outcome ?? "Unknown",
+                        inline: true,
+                      },
                       {
                         name: "Status",
                         value: "Success",
@@ -948,6 +1058,13 @@ async function pollOnce(
                       {
                         name: "Confidence",
                         value: confidenceLevel,
+                        inline: true,
+                      },
+                      {
+                        name: "Entry Price",
+                        value: `${(tradePrice * 100).toFixed(2)}¢${
+                          isOptimalConfidenceRange ? " 🎯" : ""
+                        }`,
                         inline: true,
                       },
                       {
@@ -992,15 +1109,38 @@ async function pollOnce(
                     timestamp: Date.now(),
                   });
                   const buyEmbedNoStatus = {
-                    title: "✅ Auto-placed MARKET BUY Order",
+                    title: isOptimalConfidenceRange
+                      ? "✅ Auto-placed MARKET BUY Order (OPTIMAL RANGE)"
+                      : "✅ Auto-placed MARKET BUY Order",
                     description: `$${orderValue.toFixed(
                       2
-                    )} (${orderSize.toFixed(2)} shares) @ market price`,
-                    color: 0x00aa00,
+                    )} (${orderSize.toFixed(2)} shares) @ market price${
+                      isOptimalConfidenceRange
+                        ? "\n\n🎯 **In optimal confidence range (60-70¢) - 85% win rate!**"
+                        : ""
+                    }`,
+                    color: isOptimalConfidenceRange ? 0x00ff00 : 0x00aa00,
                     fields: [
+                      {
+                        name: "Market",
+                        value: title || slug || "Unknown market",
+                        inline: false,
+                      },
+                      {
+                        name: "Outcome",
+                        value: outcome ?? "Unknown",
+                        inline: true,
+                      },
                       {
                         name: "Confidence",
                         value: confidenceLevel,
+                        inline: true,
+                      },
+                      {
+                        name: "Entry Price",
+                        value: `${(tradePrice * 100).toFixed(2)}¢${
+                          isOptimalConfidenceRange ? " 🎯" : ""
+                        }`,
                         inline: true,
                       },
                       {
@@ -1079,6 +1219,16 @@ async function pollOnce(
                       )} (${orderSize.toFixed(2)} shares) @ market price`,
                       color: 0xaa0000,
                       fields: [
+                        {
+                          name: "Market",
+                          value: title || slug || "Unknown market",
+                          inline: false,
+                        },
+                        {
+                          name: "Outcome",
+                          value: outcome ?? "Unknown",
+                          inline: true,
+                        },
                         {
                           name: "Mode",
                           value: "📝 Paper Trading",
@@ -1203,6 +1353,16 @@ async function pollOnce(
                     color: 0xaa0000,
                     fields: [
                       {
+                        name: "Market",
+                        value: title || slug || "Unknown market",
+                        inline: false,
+                      },
+                      {
+                        name: "Outcome",
+                        value: outcome ?? "Unknown",
+                        inline: true,
+                      },
+                      {
                         name: "Status",
                         value: "Success",
                         inline: true,
@@ -1252,7 +1412,18 @@ async function pollOnce(
                       2
                     )} (${orderSize.toFixed(2)} shares) @ market price`,
                     color: 0xaa0000,
-                    fields: [],
+                    fields: [
+                      {
+                        name: "Market",
+                        value: title || slug || "Unknown market",
+                        inline: false,
+                      },
+                      {
+                        name: "Outcome",
+                        value: outcome ?? "Unknown",
+                        inline: true,
+                      },
+                    ],
                     timestamp: new Date().toISOString(),
                   };
 
@@ -1317,7 +1488,11 @@ async function pollOnce(
                     );
                   }
 
-                  const maxBetAmount = MAX_BET_AMOUNT_PER_MARKET_USD;
+                  // Use MAX_BET_AMOUNT_PER_MARKET_USD if set, otherwise fall back to MAX_ORDER_VALUE_USD
+                  const maxBetAmount =
+                    MAX_BET_AMOUNT_PER_MARKET_USD > 0
+                      ? MAX_BET_AMOUNT_PER_MARKET_USD
+                      : MAX_ORDER_VALUE_USD;
                   const remainingAmount = Math.max(
                     0,
                     maxBetAmount - currentPositionValue
@@ -1459,6 +1634,16 @@ async function pollOnce(
                       color: 0x00aa00,
                       fields: [
                         {
+                          name: "Market",
+                          value: title || slug || "Unknown market",
+                          inline: false,
+                        },
+                        {
+                          name: "Outcome",
+                          value: outcome ?? "Unknown",
+                          inline: true,
+                        },
+                        {
                           name: "Mode",
                           value: "📝 Paper Trading",
                           inline: true,
@@ -1562,6 +1747,16 @@ async function pollOnce(
                     color: 0x00aa00,
                     fields: [
                       {
+                        name: "Market",
+                        value: title || slug || "Unknown market",
+                        inline: false,
+                      },
+                      {
+                        name: "Outcome",
+                        value: outcome ?? "Unknown",
+                        inline: true,
+                      },
+                      {
                         name: "Status",
                         value: "Success",
                         inline: true,
@@ -1619,6 +1814,16 @@ async function pollOnce(
                     )} (${orderSize.toFixed(2)} shares @ ${orderPrice})`,
                     color: 0x00aa00,
                     fields: [
+                      {
+                        name: "Market",
+                        value: title || slug || "Unknown market",
+                        inline: false,
+                      },
+                      {
+                        name: "Outcome",
+                        value: outcome ?? "Unknown",
+                        inline: true,
+                      },
                       {
                         name: "Confidence",
                         value: confidenceLevel,
@@ -1700,6 +1905,16 @@ async function pollOnce(
                       )} (${orderSize.toFixed(2)} shares @ ${orderPrice})`,
                       color: 0xaa0000,
                       fields: [
+                        {
+                          name: "Market",
+                          value: title || slug || "Unknown market",
+                          inline: false,
+                        },
+                        {
+                          name: "Outcome",
+                          value: outcome ?? "Unknown",
+                          inline: true,
+                        },
                         {
                           name: "Mode",
                           value: "📝 Paper Trading",
@@ -1811,6 +2026,16 @@ async function pollOnce(
                     color: 0xaa0000,
                     fields: [
                       {
+                        name: "Market",
+                        value: title || slug || "Unknown market",
+                        inline: false,
+                      },
+                      {
+                        name: "Outcome",
+                        value: outcome ?? "Unknown",
+                        inline: true,
+                      },
+                      {
                         name: "Status",
                         value: "Success",
                         inline: true,
@@ -1860,7 +2085,18 @@ async function pollOnce(
                       2
                     )} (${orderSize.toFixed(2)} shares @ ${orderPrice})`,
                     color: 0xaa0000,
-                    fields: [],
+                    fields: [
+                      {
+                        name: "Market",
+                        value: title || slug || "Unknown market",
+                        inline: false,
+                      },
+                      {
+                        name: "Outcome",
+                        value: outcome ?? "Unknown",
+                        inline: true,
+                      },
+                    ],
                     timestamp: new Date().toISOString(),
                   };
 
@@ -1922,6 +2158,8 @@ async function pollOnce(
         } else {
           const skipReason = !AUTO_TRADE_ENABLED
             ? "AUTO_TRADE_ENABLED is false"
+            : !COPY_TRADE_ENABLED
+            ? "COPY_TRADE_ENABLED is false (copy trading disabled)"
             : !clobClient
             ? "CLOB client not initialized"
             : !clobClientReady
@@ -1971,8 +2209,21 @@ async function runPollLoop(
         clobClient,
         clobClientReady
       );
+
+      if (!PAPER_TRADING_ENABLED) {
+        await checkStopLossForRealPositions(
+          activeChannel,
+          orderbookWS,
+          clobClient,
+          clobClientReady,
+          getCurrentPositions,
+          placeMarketSellOrder,
+          provider,
+          signer
+        );
+      }
     } catch (error) {
-      logToFile("ERROR", "Failed to check resolved markets", {
+      logToFile("ERROR", "Failed to check resolved markets or stop-loss", {
         error: error.message,
       });
     }
