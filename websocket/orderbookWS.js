@@ -8,6 +8,7 @@ class OrderbookWebSocketManager {
     this.apiPassphrase = apiPassphrase;
     this.ws = null;
     this.orderbooks = new Map();
+    this.lastTradePrices = new Map();
     this.subscribedAssets = new Set();
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
@@ -24,7 +25,6 @@ class OrderbookWebSocketManager {
     this.ws = new WebSocket(url);
 
     this.ws.on("open", () => {
-      logToFile("INFO", "WebSocket connected to Polymarket orderbook", {});
       this.isConnected = true;
       this.reconnectAttempts = 0;
 
@@ -61,6 +61,42 @@ class OrderbookWebSocketManager {
             bids: parsed.bids || [],
             timestamp: Date.now(),
           });
+        } else if (
+          parsed.event_type === "last_trade_price" &&
+          parsed.asset_id &&
+          parsed.price
+        ) {
+          const price = parseFloat(parsed.price);
+          if (!isNaN(price) && price >= 0 && price <= 1) {
+            this.lastTradePrices.set(parsed.asset_id, {
+              price,
+              side: parsed.side || "UNKNOWN",
+              size: parseFloat(parsed.size || 0),
+              timestamp: parseInt(parsed.timestamp || Date.now()),
+            });
+            logToFile("INFO", "Last trade price updated from WebSocket", {
+              assetId: parsed.asset_id.substring(0, 10) + "...",
+              price,
+              side: parsed.side,
+              size: parsed.size,
+            });
+          }
+        } else if (
+          parsed.event_type === "price_change" &&
+          parsed.price_changes
+        ) {
+          for (const change of parsed.price_changes) {
+            if (change.asset_id && change.best_bid) {
+              const bestBid = parseFloat(change.best_bid);
+              if (!isNaN(bestBid) && bestBid >= 0 && bestBid <= 1) {
+                this.lastTradePrices.set(change.asset_id, {
+                  price: bestBid,
+                  side: "BID",
+                  timestamp: parseInt(parsed.timestamp || Date.now()),
+                });
+              }
+            }
+          }
         } else if (parsed.type === "error" || parsed.event_type === "error") {
           logToFile("WARN", "WebSocket error message", { error: parsed });
         }
@@ -80,12 +116,13 @@ class OrderbookWebSocketManager {
     });
 
     this.ws.on("close", (code, reason) => {
-      logToFile("WARN", "WebSocket closed", {
-        code,
-        reason: reason?.toString(),
-        reconnectAttempts: this.reconnectAttempts,
-        subscribedAssets: this.subscribedAssets.size,
-      });
+      if (code !== 1006) {
+        logToFile("WARN", "WebSocket closed unexpectedly", {
+          code,
+          reason: reason?.toString(),
+          reconnectAttempts: this.reconnectAttempts,
+        });
+      }
       this.isConnected = false;
       if (this.pingInterval) {
         clearInterval(this.pingInterval);
@@ -98,10 +135,6 @@ class OrderbookWebSocketManager {
           1000 * Math.pow(2, this.reconnectAttempts),
           30000
         );
-        logToFile("INFO", "Reconnecting WebSocket", {
-          attempt: this.reconnectAttempts,
-          delayMs: delay,
-        });
         setTimeout(() => this.connect(), delay);
       } else {
         logToFile("ERROR", "WebSocket max reconnection attempts reached", {
@@ -150,6 +183,10 @@ class OrderbookWebSocketManager {
 
   getOrderbook(assetId) {
     return this.orderbooks.get(assetId) || null;
+  }
+
+  getLastTradePrice(assetId) {
+    return this.lastTradePrices.get(assetId) || null;
   }
 
   disconnect() {
