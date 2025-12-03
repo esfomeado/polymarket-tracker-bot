@@ -633,12 +633,13 @@ async function placeMarketBuyOrder(
         const orderParams = {
           tokenID: tokenId,
           amount: currentOrderAmount,
+          side: Side.BUY,
         };
         if (currentMarketPrice) {
           orderParams.price = currentMarketPrice;
         }
 
-        order = await clobClient.createMarketBuyOrder(orderParams);
+        order = await clobClient.createMarketOrder(orderParams);
 
         response = await clobClient.postOrder(order, OrderType.FOK);
 
@@ -689,11 +690,12 @@ async function placeMarketBuyOrder(
             const orderParams = {
               tokenID: tokenId,
               amount: currentOrderAmount,
+              side: Side.BUY,
             };
             if (currentMarketPrice) {
               orderParams.price = currentMarketPrice;
             }
-            order = await clobClient.createMarketBuyOrder(orderParams);
+            order = await clobClient.createMarketOrder(orderParams);
             response = await clobClient.postOrder(order, OrderType.FOK);
             if (
               response &&
@@ -772,11 +774,12 @@ async function placeMarketBuyOrder(
             const orderParams = {
               tokenID: tokenId,
               amount: currentOrderAmount,
+              side: Side.BUY,
             };
             if (currentMarketPrice) {
               orderParams.price = currentMarketPrice;
             }
-            order = await clobClient.createMarketBuyOrder(orderParams);
+            order = await clobClient.createMarketOrder(orderParams);
             continue;
           } else {
             throw new Error(
@@ -1019,133 +1022,143 @@ async function placeMarketSellOrder(
         let currentOrderSize = orderSize;
         let currentMarketPrice = marketPrice;
 
-        let orderBook = null;
-        let orderBookSource = "REST";
+        if (!marketPrice) {
+          currentMarketPrice = undefined;
+        } else {
+          let orderBook = null;
+          let orderBookSource = "REST";
 
-        try {
-          if (orderbookWS && orderbookWS.isConnected) {
-            orderbookWS.subscribe(tokenId);
-            const wsOrderbook = orderbookWS.getOrderbook(tokenId);
-            if (wsOrderbook && Date.now() - wsOrderbook.timestamp < 5000) {
-              orderBook = {
-                asks: wsOrderbook.asks,
-                bids: wsOrderbook.bids,
-              };
-              orderBookSource = "WebSocket";
+          try {
+            if (orderbookWS && orderbookWS.isConnected) {
+              orderbookWS.subscribe(tokenId);
+              const wsOrderbook = orderbookWS.getOrderbook(tokenId);
+              if (wsOrderbook && Date.now() - wsOrderbook.timestamp < 5000) {
+                orderBook = {
+                  asks: wsOrderbook.asks,
+                  bids: wsOrderbook.bids,
+                };
+                orderBookSource = "WebSocket";
+              }
             }
-          }
 
-          if (!orderBook) {
-            orderBook = await clobClient.getOrderBook(tokenId);
-            orderBookSource = "REST";
-          }
+            if (!orderBook) {
+              orderBook = await clobClient.getOrderBook(tokenId);
+              orderBookSource = "REST";
+            }
 
-          if (!orderBook.bids || orderBook.bids.length === 0) {
-            logToFile("WARN", "No bids found in orderbook, skipping order", {
-              tokenId,
-              currentOrderSize,
-              attempt,
-            });
-            throw new Error(
-              "No bids found in orderbook. Cannot place market sell order."
-            );
-          }
+            if (!orderBook.bids || orderBook.bids.length === 0) {
+              logToFile("WARN", "No bids found in orderbook, skipping order", {
+                tokenId,
+                currentOrderSize,
+                attempt,
+              });
+              throw new Error(
+                "No bids found in orderbook. Cannot place market sell order."
+              );
+            }
 
-          const sortedBids = orderBook.bids
-            .map((bid) => ({
-              price: parseFloat(bid.price),
-              size: parseFloat(bid.size),
-            }))
-            .sort((a, b) => b.price - a.price);
+            const sortedBids = orderBook.bids
+              .map((bid) => ({
+                price: parseFloat(bid.price),
+                size: parseFloat(bid.size),
+              }))
+              .sort((a, b) => b.price - a.price);
 
-          if (priceIndex >= sortedBids.length) {
-            logToFile("WARN", "No more prices to try in orderbook", {
-              tokenId,
-              priceIndex,
-              totalBids: sortedBids.length,
-              attempt,
-            });
-            throw new Error(
-              "Exhausted all available prices in orderbook. Cannot place order."
-            );
-          }
+            if (priceIndex >= sortedBids.length) {
+              logToFile("WARN", "No more prices to try in orderbook", {
+                tokenId,
+                priceIndex,
+                totalBids: sortedBids.length,
+                attempt,
+              });
+              throw new Error(
+                "Exhausted all available prices in orderbook. Cannot place order."
+              );
+            }
 
-          const selectedPrice = sortedBids[priceIndex].price;
-          let cumulativeLiquidity = 0;
-          let bidsChecked = 0;
+            const selectedPrice = sortedBids[priceIndex].price;
+            let cumulativeLiquidity = 0;
+            let bidsChecked = 0;
 
-          for (let i = priceIndex; i < sortedBids.length; i++) {
-            const bid = sortedBids[i];
-            const bidLiquidity = bid.size * bid.price;
-            cumulativeLiquidity += bidLiquidity;
-            bidsChecked++;
+            for (let i = priceIndex; i < sortedBids.length; i++) {
+              const bid = sortedBids[i];
+              const bidLiquidity = bid.size * bid.price;
+              cumulativeLiquidity += bidLiquidity;
+              bidsChecked++;
+              if (
+                cumulativeLiquidity >=
+                currentOrderSize * selectedPrice * LIQUIDITY_BUFFER
+              ) {
+                break;
+              }
+            }
+
+            const requiredLiquidity =
+              currentOrderSize * selectedPrice * LIQUIDITY_BUFFER;
+
+            const orderValue = currentOrderSize * selectedPrice;
+            if (orderValue < MIN_ORDER_VALUE_USD) {
+              const requiredSize =
+                Math.ceil((MIN_ORDER_VALUE_USD / selectedPrice) * 10000) /
+                10000;
+              currentOrderSize = Math.floor(requiredSize * 10000) / 10000;
+            }
+
+            if (orderValue > MAX_ORDER_VALUE_USD) {
+              const maxSize =
+                Math.floor((MAX_ORDER_VALUE_USD / selectedPrice) * 10000) /
+                10000;
+              currentOrderSize = Math.floor(maxSize * 10000) / 10000;
+            }
+
+            if (cumulativeLiquidity < currentOrderSize * selectedPrice) {
+              if (priceIndex < sortedBids.length - 1) {
+                priceIndex++;
+                continue;
+              }
+              throw new Error(
+                `Insufficient liquidity: ${cumulativeLiquidity.toFixed(
+                  2
+                )} available, need ${(currentOrderSize * selectedPrice).toFixed(
+                  2
+                )}`
+              );
+            }
+
+            currentMarketPrice = selectedPrice;
+          } catch (orderBookError) {
             if (
-              cumulativeLiquidity >=
-              currentOrderSize * selectedPrice * LIQUIDITY_BUFFER
+              orderBookError.message &&
+              (orderBookError.message.includes("No bids") ||
+                orderBookError.message.includes("Insufficient liquidity") ||
+                orderBookError.message.includes(
+                  "Exhausted all available prices"
+                ))
             ) {
-              break;
+              throw orderBookError;
             }
-          }
-
-          const requiredLiquidity =
-            currentOrderSize * selectedPrice * LIQUIDITY_BUFFER;
-
-          const orderValue = currentOrderSize * selectedPrice;
-          if (orderValue < MIN_ORDER_VALUE_USD) {
-            const requiredSize =
-              Math.ceil((MIN_ORDER_VALUE_USD / selectedPrice) * 10000) / 10000;
-            currentOrderSize = Math.floor(requiredSize * 10000) / 10000;
-          }
-
-          if (orderValue > MAX_ORDER_VALUE_USD) {
-            const maxSize =
-              Math.floor((MAX_ORDER_VALUE_USD / selectedPrice) * 10000) / 10000;
-            currentOrderSize = Math.floor(maxSize * 10000) / 10000;
-          }
-
-          if (cumulativeLiquidity < currentOrderSize * selectedPrice) {
-            if (priceIndex < sortedBids.length - 1) {
-              priceIndex++;
-              continue;
-            }
-            throw new Error(
-              `Insufficient liquidity: ${cumulativeLiquidity.toFixed(
-                2
-              )} available, need ${(currentOrderSize * selectedPrice).toFixed(
-                2
-              )}`
+            logToFile(
+              "WARN",
+              "Failed to fetch orderbook, proceeding with order",
+              {
+                tokenId,
+                error: orderBookError.message,
+                attempt,
+              }
             );
           }
-
-          currentMarketPrice = selectedPrice;
-        } catch (orderBookError) {
-          if (
-            orderBookError.message &&
-            (orderBookError.message.includes("No bids") ||
-              orderBookError.message.includes("Insufficient liquidity") ||
-              orderBookError.message.includes("Exhausted all available prices"))
-          ) {
-            throw orderBookError;
-          }
-          logToFile(
-            "WARN",
-            "Failed to fetch orderbook, proceeding with order",
-            {
-              tokenId,
-              error: orderBookError.message,
-              attempt,
-            }
-          );
         }
 
-        order = await clobClient.createOrder({
+        const orderParams = {
           tokenID: tokenId,
-          price: currentMarketPrice,
+          amount: currentOrderSize,
           side: Side.SELL,
-          size: currentOrderSize,
-          feeRateBps: 0,
-          nonce: orderNonce,
-        });
+        };
+        if (currentMarketPrice) {
+          orderParams.price = currentMarketPrice;
+        }
+
+        order = await clobClient.createMarketOrder(orderParams);
 
         response = await clobClient.postOrder(order, OrderType.FOK);
 
@@ -1164,14 +1177,16 @@ async function placeMarketSellOrder(
             }
           );
           if (attempt < MAX_CLOUDFLARE_RETRIES) {
-            order = await clobClient.createOrder({
+            const retryOrderParams = {
               tokenID: tokenId,
-              price: marketPrice,
+              amount: orderSize,
               side: Side.SELL,
-              size: orderSize,
-              feeRateBps: 0,
-              nonce: orderNonce,
-            });
+            };
+            if (marketPrice) {
+              retryOrderParams.price = marketPrice;
+            }
+
+            order = await clobClient.createMarketOrder(retryOrderParams);
             response = await clobClient.postOrder(order, OrderType.FOK);
             if (
               response &&

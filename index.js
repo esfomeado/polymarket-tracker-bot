@@ -83,12 +83,96 @@ if (POLYMARKET_PRIVATE_KEY) {
       const host = "https://clob.polymarket.com";
       const chainId = 137;
 
-      const credsPromise = new ClobClient(host, chainId, signer).deriveApiKey();
-      const rawCreds = await credsPromise;
+      let rawCreds;
+      try {
+        rawCreds = await new ClobClient(
+          host,
+          chainId,
+          signer
+        ).createOrDeriveApiKey();
+        logToFile("INFO", "API key created or derived successfully", {
+          hasKey: !!rawCreds.key,
+          hasSecret: !!rawCreds.secret,
+        });
+      } catch (error) {
+        logToFile(
+          "WARN",
+          "createOrDeriveApiKey failed, attempting to derive existing key",
+          {
+            error: error.message,
+          }
+        );
+        try {
+          rawCreds = await new ClobClient(host, chainId, signer).deriveApiKey();
+          logToFile("INFO", "Successfully derived existing API key", {
+            hasKey: !!rawCreds.key,
+            hasSecret: !!rawCreds.secret,
+          });
+        } catch (deriveError) {
+          logToFile("ERROR", "Failed to create or derive API key", {
+            createError: error.message,
+            deriveError: deriveError.message,
+          });
+          throw new Error(
+            `Failed to initialize API credentials: ${deriveError.message}`
+          );
+        }
+      }
+
+      if (!rawCreds || !rawCreds.key || !rawCreds.secret) {
+        throw new Error("API credentials incomplete: missing key or secret");
+      }
+
+      let secret = rawCreds.secret;
+      if (secret && typeof secret === "string") {
+        secret = secret.trim();
+        const isUrlSafe = secret.includes("-") || secret.includes("_");
+
+        if (isUrlSafe) {
+          secret = secret.replace(/-/g, "+").replace(/_/g, "/");
+        }
+
+        const remainder = secret.length % 4;
+
+        if (remainder > 0) {
+          secret += "=".repeat(4 - remainder);
+        }
+
+        const base64Regex = /^[A-Za-z0-9+/]+=*$/;
+        if (!base64Regex.test(secret)) {
+          const invalidChars = secret.match(/[^A-Za-z0-9+/=]/g);
+          logToFile("ERROR", "Secret contains invalid base64 characters", {
+            secretLength: secret.length,
+            secretPreview: secret.substring(0, 20) + "...",
+            invalidChars: invalidChars ? [...new Set(invalidChars)] : [],
+          });
+          throw new Error(
+            `Invalid API secret format: contains invalid base64 characters`
+          );
+        }
+
+        try {
+          const decoded = Buffer.from(secret, "base64");
+          if (decoded.length === 0) {
+            throw new Error("Secret decodes to empty buffer");
+          }
+        } catch (validationError) {
+          logToFile("ERROR", "Secret validation failed after conversion", {
+            error: validationError.message,
+            secretLength: secret.length,
+            secretPreview: secret.substring(0, 20) + "...",
+          });
+          throw new Error(
+            `Invalid API secret format: ${validationError.message}`
+          );
+        }
+      } else {
+        throw new Error("API secret is missing or not a string");
+      }
 
       const creds = {
-        key: rawCreds.apiKey || rawCreds.key,
-        secret: rawCreds.secret,
+        key: rawCreds.key || rawCreds.apiKey,
+        secret: secret,
         passphrase: rawCreds.passphrase,
       };
 
@@ -102,7 +186,13 @@ if (POLYMARKET_PRIVATE_KEY) {
           POLYMARKET_FUNDER
         );
       } else {
-        clobClient = new ClobClient(host, chainId, signer, creds, 0);
+        clobClient = new ClobClient(
+          host,
+          chainId,
+          signer,
+          creds,
+          POLYMARKET_SIGNATURE_TYPE
+        );
       }
 
       clobClientReady = true;
