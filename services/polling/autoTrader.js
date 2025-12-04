@@ -17,7 +17,7 @@ const {
   STOP_LOSS_PERCENTAGE,
   STOP_LOSS_WEBSOCKET_MARKET_FILTER,
 } = require("../../config");
-const { logToFile } = require("../../utils/logger");
+const { logToFile, logTradeToFile } = require("../../utils/logger");
 const {
   getPositionValueForToken,
   checkPositionLimits,
@@ -705,6 +705,25 @@ async function placeBuyOrderAuto(
         });
 
         await activeChannel.send({ embeds: [buyEmbed] });
+
+        logTradeToFile(
+          "INFO",
+          "BUY order executed successfully (Paper Trading)",
+          {
+            tokenId: tokenId.substring(0, 15) + "...",
+            conditionId: conditionId?.substring(0, 15) + "..." || null,
+            market: title || slug || "Unknown",
+            outcome,
+            orderValue,
+            orderSize,
+            entryPrice: orderPrice,
+            confidenceLevel,
+            isHighConfidenceAdd,
+            isOptimalConfidenceRange,
+            paperBalance: paperResult.balance,
+          }
+        );
+
         return { success: true, paperResult };
       }
     } else {
@@ -764,13 +783,83 @@ async function placeBuyOrderAuto(
           markInitialTradePlaced(tokenId);
         }
 
+        let actualEntryPrice = orderPrice;
+        let actualShares = orderSize;
+
+        try {
+          const { getCurrentPositions } = require("../positions");
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+
+          const positions = await getCurrentPositions();
+          const actualPosition = positions.find((pos) => {
+            const posTokenId =
+              pos.token_id || pos.tokenID || pos.asset || pos.conditionId;
+            if (!posTokenId) return false;
+            if (posTokenId === tokenId) return true;
+            if (String(posTokenId) === String(tokenId)) return true;
+            const posTokenIdStr = String(posTokenId);
+            const tokenIdStr = String(tokenId);
+            if (
+              posTokenIdStr.endsWith(tokenIdStr) ||
+              tokenIdStr.endsWith(posTokenIdStr)
+            )
+              return true;
+            const normalize = (id) =>
+              String(id).replace(/^0+/, "").toLowerCase();
+            if (normalize(posTokenIdStr) === normalize(tokenIdStr)) return true;
+            return false;
+          });
+
+          if (actualPosition) {
+            const apiAvgPrice =
+              parseFloat(actualPosition.avgPrice) ||
+              parseFloat(actualPosition.avg_price) ||
+              null;
+            const apiShares =
+              parseFloat(actualPosition.size) ||
+              parseFloat(actualPosition.shares) ||
+              parseFloat(actualPosition.amount) ||
+              null;
+
+            if (apiAvgPrice && apiAvgPrice > 0) {
+              actualEntryPrice = apiAvgPrice;
+              logToFile("INFO", "Updated entry price from actual position", {
+                tokenId: tokenId.substring(0, 10) + "...",
+                orderbookPrice: orderPrice,
+                actualEntryPrice: actualEntryPrice,
+                difference:
+                  ((actualEntryPrice - orderPrice) * 100).toFixed(2) + "¢",
+              });
+            }
+
+            if (apiShares && apiShares > 0) {
+              actualShares = apiShares;
+            }
+          } else {
+            logToFile(
+              "WARN",
+              "Could not find position in API to get actual entry price",
+              {
+                tokenId: tokenId.substring(0, 10) + "...",
+                usingOrderbookPrice: orderPrice,
+              }
+            );
+          }
+        } catch (error) {
+          logToFile("WARN", "Failed to fetch actual position for entry price", {
+            tokenId: tokenId.substring(0, 10) + "...",
+            error: error.message,
+            usingOrderbookPrice: orderPrice,
+          });
+        }
+
         const buyEmbed = discordEmbeds.createBuyOrderEmbed({
           isPaperTrading: false,
           isMarketOrder: true,
           orderValue,
-          orderSize,
+          orderSize: actualShares,
           orderPrice: "market price",
-          entryPrice: orderPrice,
+          entryPrice: actualEntryPrice,
           market: title || slug || "Unknown market",
           outcome,
           confidenceLevel,
@@ -792,6 +881,20 @@ async function placeBuyOrderAuto(
 
         await activeChannel.send({ embeds: [buyEmbed] });
 
+        logTradeToFile("INFO", "BUY order executed successfully", {
+          tokenId: tokenId.substring(0, 15) + "...",
+          conditionId: conditionId?.substring(0, 15) + "..." || null,
+          market: title || slug || "Unknown",
+          outcome,
+          orderValue,
+          orderSize,
+          entryPrice: actualEntryPrice,
+          orderId: orderResponse?.orderId || orderResponse?.id || null,
+          confidenceLevel,
+          isHighConfidenceAdd,
+          isOptimalConfidenceRange,
+        });
+
         if (
           STOP_LOSS_ENABLED &&
           !PAPER_TRADING_ENABLED &&
@@ -801,8 +904,8 @@ async function placeBuyOrderAuto(
           await setupStopLoss(
             tokenId,
             conditionId,
-            orderPrice,
-            orderSize,
+            actualEntryPrice,
+            actualShares,
             title,
             slug,
             outcome,
@@ -835,18 +938,36 @@ async function setupStopLoss(
   outcome,
   orderbookWS
 ) {
-  const matchesFilter = STOP_LOSS_WEBSOCKET_MARKET_FILTER.some((filter) => {
-    if (filter.startsWith("0x") && conditionId) {
-      return conditionId.toLowerCase() === filter.toLowerCase();
-    }
-    const keyword = filter.toLowerCase();
-    return (
-      (title && title.toLowerCase().includes(keyword)) ||
-      (slug && slug.toLowerCase().includes(keyword))
-    );
-  });
+  const shouldMonitor =
+    STOP_LOSS_WEBSOCKET_MARKET_FILTER.length === 0 ||
+    STOP_LOSS_WEBSOCKET_MARKET_FILTER.some((filter) => {
+      if (filter.startsWith("0x") && conditionId) {
+        return conditionId.toLowerCase() === filter.toLowerCase();
+      }
+      const keyword = filter.toLowerCase();
+      return (
+        (title && title.toLowerCase().includes(keyword)) ||
+        (slug && slug.toLowerCase().includes(keyword))
+      );
+    });
 
-  if (matchesFilter) {
+  if (!shouldMonitor) {
+    logToFile(
+      "INFO",
+      "Trade does not match stop-loss websocket filter - skipping websocket subscription",
+      {
+        tokenId: tokenId.substring(0, 15) + "...",
+        conditionId: conditionId?.substring(0, 15) + "..." || null,
+        market: title || slug || "Unknown",
+        filter:
+          STOP_LOSS_WEBSOCKET_MARKET_FILTER.join(", ") ||
+          "empty (monitoring all)",
+      }
+    );
+    return;
+  }
+
+  if (shouldMonitor) {
     try {
       const stopLossPrice = orderPrice * (1 - STOP_LOSS_PERCENTAGE / 100);
       const allPositions = getAllStopLossPositions();
@@ -1262,6 +1383,23 @@ async function placeSellOrderAuto(
         });
 
         await activeChannel.send({ embeds: [sellEmbed] });
+
+        logTradeToFile(
+          "INFO",
+          "SELL order executed successfully (Paper Trading)",
+          {
+            tokenId: tokenId.substring(0, 15) + "...",
+            conditionId: conditionId?.substring(0, 15) + "..." || null,
+            market: title || slug || "Unknown",
+            outcome,
+            orderValue,
+            orderSize,
+            exitPrice: orderPrice,
+            pnl: paperResult.pnl,
+            paperBalance: paperResult.balance,
+          }
+        );
+
         return { success: true, paperResult };
       }
     } else {
@@ -1339,6 +1477,18 @@ async function placeSellOrderAuto(
         });
 
         await activeChannel.send({ embeds: [sellEmbed] });
+
+        logTradeToFile("INFO", "SELL order executed successfully", {
+          tokenId: tokenId.substring(0, 15) + "...",
+          conditionId: conditionId?.substring(0, 15) + "..." || null,
+          market: title || slug || "Unknown",
+          outcome,
+          orderValue,
+          orderSize,
+          exitPrice: orderPrice,
+          orderId: orderResponse?.orderId || orderResponse?.id || null,
+        });
+
         return { success: true, orderResponse };
       } else {
         deleteTrackedPosition(tokenId);
@@ -1368,6 +1518,18 @@ async function placeSellOrderAuto(
         });
 
         await activeChannel.send({ embeds: [sellEmbed] });
+
+        logTradeToFile("INFO", "SELL order executed successfully", {
+          tokenId: tokenId.substring(0, 15) + "...",
+          conditionId: conditionId?.substring(0, 15) + "..." || null,
+          market: title || slug || "Unknown",
+          outcome,
+          orderValue,
+          orderSize,
+          exitPrice: orderPrice,
+          orderId: orderResponse?.orderId || orderResponse?.id || null,
+        });
+
         return { success: true };
       }
     }

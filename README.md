@@ -10,6 +10,7 @@ Discord bot that tracks Polymarket wallet activity and can automatically copy tr
 - **Position Management**: Track positions, set per-market limits, and total exposure caps
 - **Dynamic Sizing**: Adjusts bet sizes based on tracked wallet trade size and confidence levels
 - **WebSocket Support**: Real-time orderbook data for faster execution
+- **Stop-Loss Protection**: Automatic stop-loss execution via WebSocket orderbook monitoring for real-time price tracking and instant execution
 - **Analysis Tools**: Scripts for win rate analysis and growth projections (see `analysis/` folder)
 
 ## Quick Start
@@ -74,11 +75,20 @@ Discord bot that tracks Polymarket wallet activity and can automatically copy tr
 - `PAPER_TRADING_ENABLED` - Enable paper trading mode (default: `false`)
 - `PAPER_TRADING_INITIAL_BALANCE` - Starting balance for paper trading (default: `200`)
 
-### WebSocket (Optional)
+### WebSocket (Optional but Recommended for Stop-Loss)
 
 - `POLY_WS_API_KEY` - WebSocket API key
 - `POLY_WS_API_SECRET` - WebSocket API secret
 - `POLY_WS_API_PASSPHRASE` - WebSocket API passphrase
+
+**Note**: WebSocket is required for stop-loss functionality. Stop-loss uses real-time orderbook price updates via WebSocket for instant execution when stop-loss thresholds are reached.
+
+### Stop-Loss Configuration
+
+- `STOP_LOSS_ENABLED` - Enable stop-loss protection (default: `false`)
+- `STOP_LOSS_PERCENTAGE` - Stop-loss threshold as percentage loss (e.g., `10` for 10% loss)
+- `STOP_LOSS_MIN_TIME_SINCE_ENTRY_MS` - Minimum time in milliseconds before stop-loss can trigger (default: `60000` = 1 minute)
+- `STOP_LOSS_WEBSOCKET_MARKET_FILTER` - Optional array of market keywords or condition IDs to monitor (empty array = monitor all positions)
 
 ## Project Structure
 
@@ -94,24 +104,46 @@ Discord bot that tracks Polymarket wallet activity and can automatically copy tr
 │   ├── marketData.js      # Market data fetching
 │   ├── orders.js          # Order placement
 │   ├── positions.js       # Position tracking
-│   └── paperTrading.js    # Paper trading logic
+│   ├── paperTrading.js    # Paper trading logic
+│   └── websocketStopLoss.js  # Stop-loss execution via WebSocket
+├── websocket/
+│   └── orderbookWS.js     # WebSocket orderbook manager for real-time price updates
 ├── analysis/              # Analysis scripts
 │   ├── analyze-wallet.js  # Wallet analysis (configurable)
 │   └── compute-growth.js  # Growth projections
 └── utils/                 # Utilities
 ```
 
-## Known Issues
+## Stop-Loss Functionality
 
-### Stop-Loss Functionality
+**Stop-loss is now fully operational with WebSocket orderbook monitoring:**
 
-⚠️ **Stop-loss has known issues and may not work reliably:**
+- **Real-time Monitoring**: Uses WebSocket orderbook to monitor price changes in real-time
+- **Instant Execution**: Automatically executes market sell orders when stop-loss threshold is reached
+- **Position Tracking**: Tracks positions and calculates stop-loss prices based on entry price and configured percentage
+- **Market Filtering**: Optional market filter to monitor only specific markets (leave empty to monitor all positions)
+- **Automatic Cleanup**: Removes stop-loss monitoring when positions are closed or no longer match filters
 
-- WebSocket-based stop-loss requires market filter matching and may miss triggers
-- Real trading stop-loss uses polling which can be slow to react
-- Stop-loss positions may not persist correctly across bot restarts
+**How it works:**
 
-**Recommendation**: Use stop-loss with caution. Consider manual position management for critical trades.
+1. When a buy order is executed, a stop-loss position is created with the entry price and stop-loss threshold
+2. The bot subscribes to WebSocket orderbook updates for that token
+3. When real-time price updates drop below the stop-loss price, a market sell order is automatically executed
+4. Stop-loss monitoring is automatically cleaned up after execution or when positions are closed
+
+**Important Note on Exit Price:**
+
+- Stop-loss executes **market orders** which fill at the current best available price
+- Due to fast-moving orderbooks and market volatility, the **actual exit price may differ from your stop-loss percentage**
+- If the orderbook moves quickly (e.g., during high volatility or low liquidity), you may exit at a worse price than the stop-loss threshold
+- The stop-loss triggers when the price reaches your threshold, but actual execution price depends on current market conditions
+- Consider this when setting stop-loss percentages, especially for volatile or low-liquidity markets
+
+**Requirements:**
+
+- WebSocket API credentials must be configured (`POLY_WS_API_KEY`, `POLY_WS_API_SECRET`, `POLY_WS_API_PASSPHRASE`)
+- `STOP_LOSS_ENABLED` must be set to `true`
+- Paper trading mode disables stop-loss (only works with real trading)
 
 ### Cloudflare Blocking (Cloud Deployment)
 

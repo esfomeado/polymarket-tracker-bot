@@ -83,12 +83,96 @@ if (POLYMARKET_PRIVATE_KEY) {
       const host = "https://clob.polymarket.com";
       const chainId = 137;
 
-      const credsPromise = new ClobClient(host, chainId, signer).deriveApiKey();
-      const rawCreds = await credsPromise;
+      let rawCreds;
+      try {
+        rawCreds = await new ClobClient(
+          host,
+          chainId,
+          signer
+        ).createOrDeriveApiKey();
+        logToFile("INFO", "API key created or derived successfully", {
+          hasKey: !!rawCreds.key,
+          hasSecret: !!rawCreds.secret,
+        });
+      } catch (error) {
+        logToFile(
+          "WARN",
+          "createOrDeriveApiKey failed, attempting to derive existing key",
+          {
+            error: error.message,
+          }
+        );
+        try {
+          rawCreds = await new ClobClient(host, chainId, signer).deriveApiKey();
+          logToFile("INFO", "Successfully derived existing API key", {
+            hasKey: !!rawCreds.key,
+            hasSecret: !!rawCreds.secret,
+          });
+        } catch (deriveError) {
+          logToFile("ERROR", "Failed to create or derive API key", {
+            createError: error.message,
+            deriveError: deriveError.message,
+          });
+          throw new Error(
+            `Failed to initialize API credentials: ${deriveError.message}`
+          );
+        }
+      }
+
+      if (!rawCreds || !rawCreds.key || !rawCreds.secret) {
+        throw new Error("API credentials incomplete: missing key or secret");
+      }
+
+      let secret = rawCreds.secret;
+      if (secret && typeof secret === "string") {
+        secret = secret.trim();
+        const isUrlSafe = secret.includes("-") || secret.includes("_");
+
+        if (isUrlSafe) {
+          secret = secret.replace(/-/g, "+").replace(/_/g, "/");
+        }
+
+        const remainder = secret.length % 4;
+
+        if (remainder > 0) {
+          secret += "=".repeat(4 - remainder);
+        }
+
+        const base64Regex = /^[A-Za-z0-9+/]+=*$/;
+        if (!base64Regex.test(secret)) {
+          const invalidChars = secret.match(/[^A-Za-z0-9+/=]/g);
+          logToFile("ERROR", "Secret contains invalid base64 characters", {
+            secretLength: secret.length,
+            secretPreview: secret.substring(0, 20) + "...",
+            invalidChars: invalidChars ? [...new Set(invalidChars)] : [],
+          });
+          throw new Error(
+            `Invalid API secret format: contains invalid base64 characters`
+          );
+        }
+
+        try {
+          const decoded = Buffer.from(secret, "base64");
+          if (decoded.length === 0) {
+            throw new Error("Secret decodes to empty buffer");
+          }
+        } catch (validationError) {
+          logToFile("ERROR", "Secret validation failed after conversion", {
+            error: validationError.message,
+            secretLength: secret.length,
+            secretPreview: secret.substring(0, 20) + "...",
+          });
+          throw new Error(
+            `Invalid API secret format: ${validationError.message}`
+          );
+        }
+      } else {
+        throw new Error("API secret is missing or not a string");
+      }
 
       const creds = {
-        key: rawCreds.apiKey || rawCreds.key,
-        secret: rawCreds.secret,
+        key: rawCreds.key || rawCreds.apiKey,
+        secret: secret,
         passphrase: rawCreds.passphrase,
       };
 
@@ -102,7 +186,13 @@ if (POLYMARKET_PRIVATE_KEY) {
           POLYMARKET_FUNDER
         );
       } else {
-        clobClient = new ClobClient(host, chainId, signer, creds, 0);
+        clobClient = new ClobClient(
+          host,
+          chainId,
+          signer,
+          creds,
+          POLYMARKET_SIGNATURE_TYPE
+        );
       }
 
       clobClientReady = true;
@@ -121,392 +211,8 @@ if (POLYMARKET_PRIVATE_KEY) {
           POLY_WS_API_PASSPHRASE
         );
 
-        const {
-          handleWebSocketStopLoss,
-        } = require("./services/websocketStopLoss");
-        orderbookWS.setStopLossCallback((tokenId, price, side) => {
-          handleWebSocketStopLoss(
-            tokenId,
-            price,
-            side,
-            clobClient,
-            clobClientReady,
-            getActiveChannel(),
-            orderbookWS
-          );
-        });
-
         orderbookWS.connect();
         logToFile("INFO", "WebSocket orderbook manager initialized", {});
-
-        const {
-          loadStopLossPositions,
-          getCurrentPositions,
-          setStopLossPosition,
-        } = require("./services/positions");
-        const {
-          STOP_LOSS_WEBSOCKET_MARKET_FILTER,
-          STOP_LOSS_ENABLED,
-          STOP_LOSS_PERCENTAGE,
-          PAPER_TRADING_ENABLED,
-        } = require("./config");
-        orderbookWS.on("connected", async () => {
-          setTimeout(async () => {
-            const tokenIds = loadStopLossPositions();
-            if (tokenIds.length > 0) {
-              logToFile(
-                "INFO",
-                "Restoring WebSocket subscriptions for stop-loss positions",
-                {
-                  count: tokenIds.length,
-                  filter: STOP_LOSS_WEBSOCKET_MARKET_FILTER.join(", "),
-                }
-              );
-              for (const tokenId of tokenIds) {
-                orderbookWS.subscribe(tokenId);
-              }
-            }
-
-            if (
-              STOP_LOSS_ENABLED &&
-              !PAPER_TRADING_ENABLED &&
-              clobClient &&
-              clobClientReady
-            ) {
-              try {
-                const positions = await getCurrentPositions();
-                if (positions.length > 0) {
-                  logToFile("DEBUG", "Sample position structure from API", {
-                    positionIndex: 0,
-                    allKeys: Object.keys(positions[0]),
-                    fullPosition: JSON.stringify(
-                      positions[0],
-                      null,
-                      2
-                    ).substring(0, 1000),
-                  });
-                }
-
-                logToFile(
-                  "INFO",
-                  "Checking current positions for stop-loss registration on startup",
-                  {
-                    totalPositions: positions.length,
-                    samplePosition:
-                      positions.length > 0
-                        ? {
-                            keys: Object.keys(positions[0]),
-                            sampleData: {
-                              token_id: positions[0].token_id
-                                ? String(positions[0].token_id).length > 10
-                                  ? String(positions[0].token_id).substring(
-                                      0,
-                                      10
-                                    ) + "..."
-                                  : String(positions[0].token_id)
-                                : null,
-                              tokenId: positions[0].tokenId
-                                ? String(positions[0].tokenId).length > 10
-                                  ? String(positions[0].tokenId).substring(
-                                      0,
-                                      10
-                                    ) + "..."
-                                  : String(positions[0].tokenId)
-                                : null,
-                              tokenID: positions[0].tokenID
-                                ? String(positions[0].tokenID).length > 10
-                                  ? String(positions[0].tokenID).substring(
-                                      0,
-                                      10
-                                    ) + "..."
-                                  : String(positions[0].tokenID)
-                                : null,
-                              asset: positions[0].asset
-                                ? String(positions[0].asset).length > 10
-                                  ? String(positions[0].asset).substring(
-                                      0,
-                                      10
-                                    ) + "..."
-                                  : String(positions[0].asset)
-                                : null,
-                              asset_id: positions[0].asset_id
-                                ? String(positions[0].asset_id).length > 10
-                                  ? String(positions[0].asset_id).substring(
-                                      0,
-                                      10
-                                    ) + "..."
-                                  : String(positions[0].asset_id)
-                                : null,
-                              title: positions[0].title,
-                              market: positions[0].market,
-                              question: positions[0].question,
-                              slug: positions[0].slug,
-                              conditionId: positions[0].conditionId,
-                              condition_id: positions[0].condition_id,
-                            },
-                          }
-                        : null,
-                  }
-                );
-
-                let registeredCount = 0;
-                let checkedCount = 0;
-                let skippedNoTokenId = 0;
-                for (const pos of positions) {
-                  const tokenId =
-                    pos.token_id ||
-                    pos.tokenId ||
-                    pos.tokenID ||
-                    pos.asset ||
-                    pos.asset_id ||
-                    (pos.asset && typeof pos.asset === "string"
-                      ? pos.asset
-                      : null);
-                  if (!tokenId) {
-                    skippedNoTokenId++;
-                    logToFile("DEBUG", "Position missing tokenId, skipping", {
-                      positionKeys: Object.keys(pos),
-                      hasToken_id: !!pos.token_id,
-                      hasTokenId: !!pos.tokenId,
-                      hasTokenID: !!pos.tokenID,
-                      hasAsset: !!pos.asset,
-                      hasAsset_id: !!pos.asset_id,
-                      assetType: typeof pos.asset,
-                      assetValue: pos.asset,
-                    });
-                    continue;
-                  }
-
-                  checkedCount++;
-
-                  if (tokenIds.includes(tokenId)) {
-                    logToFile(
-                      "DEBUG",
-                      "Position already registered, skipping",
-                      {
-                        tokenId: tokenId.substring(0, 10) + "...",
-                      }
-                    );
-                    continue;
-                  }
-
-                  let title = pos.title || pos.market || pos.question || "";
-                  let slug = pos.slug || "";
-                  let conditionId = pos.conditionId || pos.condition_id || null;
-                  let outcome = pos.outcome || pos.outcome_title || null;
-
-                  if (
-                    (!title || !conditionId) &&
-                    clobClient &&
-                    clobClientReady
-                  ) {
-                    try {
-                      const marketUrl = `https://data-api.polymarket.com/markets?tokenId=${tokenId}`;
-                      const response = await fetch(marketUrl, {
-                        headers: { Accept: "application/json" },
-                      });
-
-                      if (response.ok) {
-                        const markets = await response.json();
-                        if (Array.isArray(markets) && markets.length > 0) {
-                          const market = markets[0];
-                          if (!title)
-                            title =
-                              market.question ||
-                              market.title ||
-                              market.market ||
-                              "";
-                          if (!slug) slug = market.slug || "";
-                          if (!conditionId)
-                            conditionId = market.conditionId || null;
-                          if (
-                            !outcome &&
-                            market.tokens &&
-                            Array.isArray(market.tokens)
-                          ) {
-                            for (const token of market.tokens) {
-                              const tokenIdStr = String(
-                                token.token_id ||
-                                  token.asset_id ||
-                                  token.id ||
-                                  ""
-                              );
-                              if (tokenIdStr === String(tokenId)) {
-                                outcome =
-                                  token.outcome ||
-                                  token.title ||
-                                  token.name ||
-                                  null;
-                                break;
-                              }
-                            }
-                          }
-                        }
-                      }
-                    } catch (fetchError) {
-                      logToFile(
-                        "WARN",
-                        "Failed to fetch market info for position",
-                        {
-                          tokenId: tokenId.substring(0, 10) + "...",
-                          error: fetchError.message,
-                        }
-                      );
-                    }
-                  }
-                  logToFile(
-                    "DEBUG",
-                    "Checking position for stop-loss registration",
-                    {
-                      tokenId: tokenId.substring(0, 10) + "...",
-                      hasTitle: !!title,
-                      title: title.substring(0, 50) || "N/A",
-                      hasSlug: !!slug,
-                      slug: slug.substring(0, 50) || "N/A",
-                      hasConditionId: !!conditionId,
-                      conditionId: conditionId
-                        ? conditionId.substring(0, 10) + "..."
-                        : "N/A",
-                      hasOutcome: !!outcome,
-                      outcome: outcome || "N/A",
-                      positionKeys: Object.keys(pos),
-                    }
-                  );
-
-                  const matchesFilter = STOP_LOSS_WEBSOCKET_MARKET_FILTER.some(
-                    (filter) => {
-                      if (filter.startsWith("0x") && conditionId) {
-                        return (
-                          conditionId.toLowerCase() === filter.toLowerCase()
-                        );
-                      }
-                      const keyword = filter.toLowerCase();
-                      const titleMatch =
-                        title && title.toLowerCase().includes(keyword);
-                      const slugMatch =
-                        slug && slug.toLowerCase().includes(keyword);
-                      return titleMatch || slugMatch;
-                    }
-                  );
-
-                  logToFile("DEBUG", "Position filter check result", {
-                    tokenId: tokenId.substring(0, 10) + "...",
-                    matchesFilter,
-                    filter: STOP_LOSS_WEBSOCKET_MARKET_FILTER.join(", "),
-                    title: title.substring(0, 50) || "N/A",
-                    slug: slug.substring(0, 50) || "N/A",
-                  });
-
-                  if (matchesFilter) {
-                    try {
-                      const entryPrice =
-                        pos.avg_price ||
-                        pos.avgPrice ||
-                        pos.price ||
-                        pos.last_price ||
-                        null;
-                      const shares = pos.shares || pos.size || 0;
-
-                      if (entryPrice && shares > 0) {
-                        const stopLossPrice =
-                          entryPrice * (1 - STOP_LOSS_PERCENTAGE / 100);
-                        setStopLossPosition(
-                          tokenId,
-                          entryPrice,
-                          shares,
-                          stopLossPrice,
-                          {
-                            market: title || slug || "Unknown",
-                            conditionId: conditionId || null,
-                            outcome: outcome || null,
-                          }
-                        );
-
-                        orderbookWS.subscribe(tokenId);
-                        registeredCount++;
-
-                        logToFile(
-                          "INFO",
-                          "Registered stop-loss for existing BTC position on startup",
-                          {
-                            tokenId: tokenId.substring(0, 10) + "...",
-                            market: title || slug || "Unknown",
-                            entryPrice,
-                            shares,
-                            stopLossPrice,
-                            conditionId: conditionId
-                              ? conditionId.substring(0, 10) + "..."
-                              : null,
-                          }
-                        );
-                      } else {
-                        logToFile(
-                          "WARN",
-                          "Skipping position - missing entry price or shares",
-                          {
-                            tokenId: tokenId.substring(0, 10) + "...",
-                            hasEntryPrice: !!entryPrice,
-                            shares,
-                          }
-                        );
-                      }
-                    } catch (error) {
-                      logToFile(
-                        "ERROR",
-                        "Error registering stop-loss for existing position",
-                        {
-                          tokenId: tokenId.substring(0, 10) + "...",
-                          error: error.message,
-                        }
-                      );
-                    }
-                  }
-                }
-
-                logToFile(
-                  "INFO",
-                  "Finished checking current positions for stop-loss registration",
-                  {
-                    totalPositions: positions.length,
-                    checkedPositions: checkedCount,
-                    skippedNoTokenId,
-                    registeredCount,
-                    filter: STOP_LOSS_WEBSOCKET_MARKET_FILTER.join(", "),
-                  }
-                );
-
-                if (registeredCount > 0) {
-                  logToFile(
-                    "INFO",
-                    "Registered stop-loss for existing positions on startup",
-                    {
-                      count: registeredCount,
-                      filter: STOP_LOSS_WEBSOCKET_MARKET_FILTER.join(", "),
-                    }
-                  );
-                } else if (checkedCount > 0) {
-                  logToFile(
-                    "INFO",
-                    "No positions matched the filter or were missing required data",
-                    {
-                      checkedCount,
-                      filter: STOP_LOSS_WEBSOCKET_MARKET_FILTER.join(", "),
-                    }
-                  );
-                }
-              } catch (error) {
-                logToFile(
-                  "ERROR",
-                  "Error checking current positions for stop-loss on startup",
-                  {
-                    error: error.message,
-                    stack: error.stack,
-                  }
-                );
-              }
-            }
-          }, 2000);
-        });
       } else {
         logToFile(
           "WARN",

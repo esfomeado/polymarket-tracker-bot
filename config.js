@@ -82,7 +82,7 @@ const STOP_LOSS_WEBSOCKET_MARKET_FILTER = process.env
   ? process.env.STOP_LOSS_WEBSOCKET_MARKET_FILTER.split(",").map((s) =>
       s.trim()
     )
-  : ["bitcoin"];
+  : [];
 const POLY_WS_API_KEY = process.env.POLY_WS_API_KEY;
 const POLY_WS_API_SECRET = process.env.POLY_WS_API_SECRET;
 const POLY_WS_API_PASSPHRASE = process.env.POLY_WS_API_PASSPHRASE;
