@@ -83,44 +83,19 @@ if (POLYMARKET_PRIVATE_KEY) {
       const host = "https://clob.polymarket.com";
       const chainId = 137;
 
+      const tempClient = new ClobClient(host, chainId, signer);
       let rawCreds;
       try {
-        rawCreds = await new ClobClient(
-          host,
-          chainId,
-          signer
-        ).createOrDeriveApiKey();
-        logToFile("INFO", "API key created or derived successfully", {
-          hasKey: !!rawCreds.key,
-          hasSecret: !!rawCreds.secret,
-        });
+        rawCreds = await tempClient.createOrDeriveApiKey();
       } catch (error) {
         logToFile(
           "WARN",
-          "createOrDeriveApiKey failed, attempting to derive existing key",
+          "createOrDeriveApiKey failed, falling back to deriveApiKey",
           {
             error: error.message,
           }
         );
-        try {
-          rawCreds = await new ClobClient(host, chainId, signer).deriveApiKey();
-          logToFile("INFO", "Successfully derived existing API key", {
-            hasKey: !!rawCreds.key,
-            hasSecret: !!rawCreds.secret,
-          });
-        } catch (deriveError) {
-          logToFile("ERROR", "Failed to create or derive API key", {
-            createError: error.message,
-            deriveError: deriveError.message,
-          });
-          throw new Error(
-            `Failed to initialize API credentials: ${deriveError.message}`
-          );
-        }
-      }
-
-      if (!rawCreds || !rawCreds.key || !rawCreds.secret) {
-        throw new Error("API credentials incomplete: missing key or secret");
+        rawCreds = await tempClient.deriveApiKey();
       }
 
       let secret = rawCreds.secret;
