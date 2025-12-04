@@ -1,6 +1,6 @@
 const WebSocket = require("ws");
 const { EventEmitter } = require("events");
-const { logToFile } = require("../utils/logger");
+const { logToFile, logWebSocketToFile } = require("../utils/logger");
 
 class OrderbookWebSocketManager extends EventEmitter {
   constructor(apiKey, apiSecret, apiPassphrase) {
@@ -32,6 +32,10 @@ class OrderbookWebSocketManager extends EventEmitter {
       this.isConnected = true;
       this.reconnectAttempts = 0;
       if (!wasReconnecting) {
+        logWebSocketToFile("INFO", "WebSocket connected successfully", {
+          url: url,
+          subscribedAssets: this.subscribedAssets.size,
+        });
         logToFile("INFO", "WebSocket connected successfully", {
           url: url,
           subscribedAssets: this.subscribedAssets.size,
@@ -51,7 +55,7 @@ class OrderbookWebSocketManager extends EventEmitter {
 
       setTimeout(() => {
         this.resubscribeAll();
-      }, 1000);
+      }, 100);
     });
 
     this.ws.on("message", (data) => {
@@ -88,7 +92,8 @@ class OrderbookWebSocketManager extends EventEmitter {
 
             if (
               this.stopLossCallback &&
-              typeof this.stopLossCallback === "function"
+              typeof this.stopLossCallback === "function" &&
+              this.subscribedAssets.has(parsed.asset_id)
             ) {
               try {
                 this.stopLossCallback(
@@ -189,23 +194,59 @@ class OrderbookWebSocketManager extends EventEmitter {
 
     this.subscribedAssets.add(assetId);
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      try {
-        const subscribeMessage = {
-          assets_ids: [assetId],
-          type: "market",
-        };
-        this.ws.send(JSON.stringify(subscribeMessage));
-        logToFile("INFO", "Subscribed to asset on WebSocket", {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.isConnected) {
+      logWebSocketToFile(
+        "INFO",
+        "New subscription requires connection restart (CLOB WebSocket limitation)",
+        {
           assetId: assetId.substring(0, 10) + "...",
           totalSubscribed: this.subscribedAssets.size,
-        });
+          note: "Closing and reopening connection with all subscriptions",
+        }
+      );
+
+      try {
+        this.ws.close(1000, "Reconnecting to add new subscription");
+        this.isConnected = false;
       } catch (error) {
-        logToFile("WARN", "Failed to send subscription message", {
-          assetId: assetId.substring(0, 10) + "...",
-          error: error.message,
-        });
+        logWebSocketToFile(
+          "WARN",
+          "Failed to close WebSocket for resubscription",
+          {
+            assetId: assetId.substring(0, 10) + "...",
+            error: error.message,
+          }
+        );
+        this._tryDirectSubscription(assetId);
       }
+      return;
+    } else if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this._tryDirectSubscription(assetId);
+    } else {
+      logWebSocketToFile(
+        "INFO",
+        "Asset queued for subscription on connection open",
+        {
+          assetId: assetId.substring(0, 10) + "...",
+          wsReadyState: this.ws?.readyState || "N/A",
+          isConnected: this.isConnected,
+        }
+      );
+    }
+  }
+
+  _tryDirectSubscription(assetId) {
+    try {
+      const subscribeMessage = {
+        assets_ids: [assetId],
+        type: "market",
+      };
+      this.ws.send(JSON.stringify(subscribeMessage));
+    } catch (error) {
+      logWebSocketToFile("WARN", "Failed to send direct subscription message", {
+        assetId: assetId.substring(0, 10) + "...",
+        error: error.message,
+      });
     }
   }
 
@@ -221,6 +262,9 @@ class OrderbookWebSocketManager extends EventEmitter {
       };
       this.ws.send(JSON.stringify(subscribeMessage));
       if (this.subscribedAssets.size > 0) {
+        logWebSocketToFile("INFO", "Resubscribed to all assets on WebSocket", {
+          assetCount: this.subscribedAssets.size,
+        });
         logToFile("INFO", "Resubscribed to all assets on WebSocket", {
           assetCount: this.subscribedAssets.size,
         });
@@ -251,6 +295,10 @@ class OrderbookWebSocketManager extends EventEmitter {
           unsubscribe: true,
         };
         this.ws.send(JSON.stringify(unsubscribeMessage));
+        logWebSocketToFile("INFO", "Unsubscribed from asset on WebSocket", {
+          assetId: assetId.substring(0, 10) + "...",
+          totalSubscribed: this.subscribedAssets.size,
+        });
         logToFile("INFO", "Unsubscribed from asset on WebSocket", {
           assetId: assetId.substring(0, 10) + "...",
           totalSubscribed: this.subscribedAssets.size,

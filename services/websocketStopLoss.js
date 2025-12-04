@@ -5,8 +5,13 @@ const {
   STOP_LOSS_WEBSOCKET_MARKET_FILTER,
   PAPER_TRADING_ENABLED,
 } = require("../config");
-const { logToFile } = require("../utils/logger");
-const { getStopLossPosition, deleteStopLossPosition } = require("./positions");
+const { logToFile, logTradeToFile } = require("../utils/logger");
+const {
+  getStopLossPosition,
+  deleteStopLossPosition,
+  getCurrentPositions,
+  getAllStopLossPositions,
+} = require("./positions");
 const { placeMarketSellOrder } = require("./orders");
 
 async function handleWebSocketStopLoss(
@@ -19,7 +24,7 @@ async function handleWebSocketStopLoss(
   orderbookWS
 ) {
   if (!STOP_LOSS_ENABLED || PAPER_TRADING_ENABLED) {
-    return; // Only for real trading
+    return;
   }
 
   if (!clobClient || !clobClientReady) {
@@ -27,23 +32,52 @@ async function handleWebSocketStopLoss(
   }
 
   try {
-    const stopLossPosition = getStopLossPosition(tokenId);
+    let stopLossPosition = getStopLossPosition(tokenId);
+
+    if (!stopLossPosition) {
+      const allStopLossPositions = getAllStopLossPositions();
+      if (allStopLossPositions && allStopLossPositions.size > 0) {
+        const tokenIdSuffix = tokenId?.slice(-20) || "";
+        for (const [
+          storedTokenId,
+          position,
+        ] of allStopLossPositions.entries()) {
+          if (
+            storedTokenId === tokenId ||
+            String(storedTokenId) === String(tokenId)
+          ) {
+            stopLossPosition = position;
+            break;
+          }
+          if (
+            storedTokenId.endsWith(tokenIdSuffix) ||
+            tokenId.endsWith(storedTokenId.slice(-20))
+          ) {
+            stopLossPosition = position;
+            break;
+          }
+        }
+      }
+    }
+
     if (!stopLossPosition) {
       return;
     }
-    const matchesFilter = STOP_LOSS_WEBSOCKET_MARKET_FILTER.some((filter) => {
-      if (filter.startsWith("0x") && stopLossPosition.conditionId) {
-        return (
-          stopLossPosition.conditionId.toLowerCase() === filter.toLowerCase()
-        );
-      }
-      if (stopLossPosition.market) {
-        return stopLossPosition.market
-          .toLowerCase()
-          .includes(filter.toLowerCase());
-      }
-      return false;
-    });
+    const matchesFilter =
+      STOP_LOSS_WEBSOCKET_MARKET_FILTER.length === 0 ||
+      STOP_LOSS_WEBSOCKET_MARKET_FILTER.some((filter) => {
+        if (filter.startsWith("0x") && stopLossPosition.conditionId) {
+          return (
+            stopLossPosition.conditionId.toLowerCase() === filter.toLowerCase()
+          );
+        }
+        if (stopLossPosition.market) {
+          return stopLossPosition.market
+            .toLowerCase()
+            .includes(filter.toLowerCase());
+        }
+        return false;
+      });
 
     if (!matchesFilter) {
       deleteStopLossPosition(tokenId);
@@ -69,8 +103,13 @@ async function handleWebSocketStopLoss(
       return;
     }
 
-    const { entryPrice, shares, entryTimestamp, stopLossPrice } =
-      stopLossPosition;
+    const {
+      entryPrice,
+      shares: storedShares,
+      entryTimestamp,
+      stopLossPrice,
+    } = stopLossPosition;
+    let shares = storedShares;
 
     const now = Date.now();
     if (
@@ -86,10 +125,6 @@ async function handleWebSocketStopLoss(
 
     const lossPercentage = ((entryPrice - currentPrice) / entryPrice) * 100;
 
-    if (lossPercentage < STOP_LOSS_PERCENTAGE) {
-      return;
-    }
-
     logToFile("WARN", "WebSocket stop-loss triggered", {
       tokenId: tokenId.substring(0, 10) + "...",
       entryPrice,
@@ -101,11 +136,91 @@ async function handleWebSocketStopLoss(
     });
 
     try {
+      const positions = await getCurrentPositions();
+
+      const actualPosition = positions.find((pos) => {
+        const posTokenId =
+          pos.token_id || pos.tokenID || pos.asset || pos.conditionId;
+        if (!posTokenId) return false;
+        if (posTokenId === tokenId) return true;
+        if (String(posTokenId) === String(tokenId)) return true;
+        const posTokenIdStr = String(posTokenId);
+        const tokenIdStr = String(tokenId);
+        if (
+          posTokenIdStr.endsWith(tokenIdStr) ||
+          tokenIdStr.endsWith(posTokenIdStr)
+        )
+          return true;
+        const normalize = (id) => String(id).replace(/^0+/, "").toLowerCase();
+        if (normalize(posTokenIdStr) === normalize(tokenIdStr)) return true;
+        return false;
+      });
+
+      if (!actualPosition) {
+        logToFile(
+          "WARN",
+          "Stop-loss triggered but position no longer exists, cleaning up",
+          {
+            tokenId: tokenId.substring(0, 10) + "...",
+            entryPrice,
+            currentPrice,
+            expectedShares: shares,
+            totalPositions: positions.length,
+            availableTokenIds: positions.slice(0, 3).map((pos) => ({
+              token_id: pos.token_id?.substring(0, 10) + "...",
+              tokenID: pos.tokenID?.substring(0, 10) + "...",
+              asset: pos.asset?.substring(0, 10) + "...",
+            })),
+          }
+        );
+        deleteStopLossPosition(tokenId);
+        if (orderbookWS) {
+          orderbookWS.unsubscribe(tokenId);
+        }
+        return;
+      }
+
+      const actualShares =
+        parseFloat(actualPosition.size) ||
+        parseFloat(actualPosition.shares) ||
+        parseFloat(actualPosition.amount) ||
+        0;
+
+      if (actualShares <= 0) {
+        logToFile("WARN", "Stop-loss position has no shares, cleaning up", {
+          tokenId: tokenId.substring(0, 10) + "...",
+        });
+        deleteStopLossPosition(tokenId);
+        if (orderbookWS) {
+          orderbookWS.unsubscribe(tokenId);
+        }
+        return;
+      }
+
+      if (Math.abs(actualShares - shares) > 0.001) {
+        logToFile(
+          "INFO",
+          "Using actual position size instead of stored amount",
+          {
+            tokenId: tokenId.substring(0, 10) + "...",
+            storedShares: shares,
+            actualShares: actualShares,
+            difference: (actualShares - shares).toFixed(4),
+          }
+        );
+      }
+
+      shares = actualShares;
+
       const sellResult = await placeMarketSellOrder(
         tokenId,
         shares,
+        null,
         clobClient,
-        clobClientReady
+        clobClientReady,
+        null,
+        null,
+        null
       );
 
       if (sellResult && sellResult.error) {
@@ -134,6 +249,19 @@ async function handleWebSocketStopLoss(
         exitPrice: currentPrice,
         shares,
         lossPercentage: lossPercentage.toFixed(2),
+        orderId: sellResult?.orderId,
+      });
+
+      logTradeToFile("INFO", "SELL order executed (STOP-LOSS)", {
+        tokenId: tokenId.substring(0, 10) + "...",
+        orderValue: (shares * currentPrice).toFixed(4),
+        orderSize: shares.toFixed(4),
+        orderPrice: currentPrice.toFixed(4),
+        entryPrice: entryPrice.toFixed(4),
+        exitPrice: currentPrice.toFixed(4),
+        lossPercentage: lossPercentage.toFixed(2),
+        market: stopLossPosition.market,
+        outcome: stopLossPosition.outcome,
         orderId: sellResult?.orderId,
       });
 
@@ -186,6 +314,27 @@ async function handleWebSocketStopLoss(
         });
       }
     } catch (error) {
+      if (
+        error.message &&
+        (error.message.includes("not enough balance") ||
+          error.message.includes("don't own enough tokens") ||
+          error.message.includes("You need to buy tokens first"))
+      ) {
+        logToFile(
+          "WARN",
+          "Stop-loss failed: position no longer exists or insufficient balance, cleaning up",
+          {
+            tokenId: tokenId.substring(0, 10) + "...",
+            error: error.message,
+          }
+        );
+        deleteStopLossPosition(tokenId);
+        if (orderbookWS) {
+          orderbookWS.unsubscribe(tokenId);
+        }
+        return;
+      }
+
       logToFile("ERROR", "Error executing stop-loss market sell", {
         tokenId: tokenId.substring(0, 10) + "...",
         error: error.message,

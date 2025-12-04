@@ -24,6 +24,7 @@ const { getPaperTradingState } = require("./paperTrading");
 const { STOP_LOSS_ENABLED } = require("../config");
 const { checkAndSettleResolvedMarkets } = require("./settlement");
 const { getCurrentPositions } = require("./positions");
+const { handleWebSocketStopLoss } = require("./websocketStopLoss");
 
 const pollingState = require("./polling/state");
 const discordEmbeds = require("./polling/discordEmbeds");
@@ -412,6 +413,8 @@ async function runPollLoop(
               const market = markets[0];
               const isResolved =
                 market.resolved === true ||
+                market.status === "Resolved" ||
+                market.status === "Closed" ||
                 market.active === false ||
                 (market.endDate_iso &&
                   new Date(market.endDate_iso) < new Date());
@@ -525,6 +528,26 @@ async function startPolling(
   pollingState.setIsPolling(true);
   pollingState.setIsInitialized(false);
   pollingState.clearSeenHashes();
+
+  if (orderbookWS && STOP_LOSS_ENABLED && !PAPER_TRADING_ENABLED) {
+    const { getClobClient } = require("./positions");
+    orderbookWS.setStopLossCallback((tokenId, currentPrice, side) => {
+      const {
+        clobClient: currentClobClient,
+        clobClientReady: currentClobClientReady,
+      } = getClobClient();
+      handleWebSocketStopLoss(
+        tokenId,
+        currentPrice,
+        side,
+        currentClobClient,
+        currentClobClientReady,
+        pollingState.getActiveChannel(),
+        orderbookWS
+      );
+    });
+    logToFile("INFO", "WebSocket stop-loss callback registered", {});
+  }
 
   const walletDisplay =
     walletToUse.substring(0, 6) + "..." + walletToUse.substring(38);
